@@ -33,6 +33,6 @@ export type VllmHealth = {
 
 export type ConfigStatus = {
   docker: { available: boolean; detail: string; error: string };
-  vllm_image: { image: string; pulled: boolean; detail: string; error: string };
+  vllm_image: { image: string; images: string[]; pulled: boolean; detail: string; error: string };
   gpu: { detected: boolean; devices: string[]; error: string };
 };

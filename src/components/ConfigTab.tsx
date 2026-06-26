@@ -22,7 +22,8 @@ function ConfigRow({ label, ok, value, detail }: { label: string; ok: boolean; v
 
 export function ConfigTab({ config, error }: { config: ConfigStatus | null; error: string }) {
   const dockerDetail = config?.docker.detail || config?.docker.error || "Checking Docker...";
-  const imageDetail = config?.vllm_image.detail || config?.vllm_image.error || "Checking local image...";
+  const imageDetail = config?.vllm_image.detail || config?.vllm_image.error || "Scanning local Docker images...";
+  const imageValue = config ? (config.vllm_image.images.length ? config.vllm_image.images.join(", ") : config.vllm_image.image || "No vLLM image found") : "Scanning...";
   const gpuNames = config?.gpu.devices.length ? config.gpu.devices.join(", ") : "No GPU detected";
 
   return (
@@ -34,7 +35,7 @@ export function ConfigTab({ config, error }: { config: ConfigStatus | null; erro
       {error ? <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div> : null}
       <div className="grid gap-3">
         <ConfigRow label="Docker" ok={config?.docker.available === true} value={config?.docker.available ? "Installed" : "Not installed"} detail={dockerDetail} />
-        <ConfigRow label="vLLM image" ok={config?.vllm_image.pulled === true} value={config?.vllm_image.image ?? "vllm/vllm-openai:latest"} detail={imageDetail} />
+        <ConfigRow label="vLLM image" ok={config?.vllm_image.pulled === true} value={imageValue} detail={imageDetail} />
         <ConfigRow label="Detected GPU" ok={config?.gpu.detected === true} value={gpuNames} detail={config?.gpu.error || undefined} />
       </div>
     </section>

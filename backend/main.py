@@ -84,7 +84,8 @@ class ToolStatus(BaseModel):
 
 
 class ImageStatus(BaseModel):
-    image: str
+    image: str = ""
+    images: list[str] = []
     pulled: bool = False
     detail: str = ""
     error: str = ""
@@ -125,9 +126,9 @@ def vllm_health_url(base_url: str) -> str:
     return urljoin(f"{root}/", "health")
 
 
-def vllm_docker_image() -> str:
+def configured_vllm_docker_image() -> str:
     load_dotenv(ENV_PATH, override=True)
-    return os.getenv("VLLM_DOCKER_IMAGE", "vllm/vllm-openai:latest")
+    return os.getenv("VLLM_DOCKER_IMAGE", "").strip()
 
 
 def run_command(command: list[str], timeout: int = 5) -> subprocess.CompletedProcess[str]:
@@ -148,18 +149,52 @@ def docker_status() -> ToolStatus:
     return ToolStatus(available=True, detail=result.stdout.strip())
 
 
-def vllm_image_status(image: str, docker: ToolStatus) -> ImageStatus:
-    if not docker.available:
-        return ImageStatus(image=image, pulled=False, error="Docker is not available")
-
-    try:
-        result = run_command(["docker", "image", "inspect", image])
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return ImageStatus(image=image, pulled=False, error=str(exc))
-
+def local_vllm_images() -> list[str]:
+    result = run_command(["docker", "image", "ls", "--format", "{{json .}}"])
     if result.returncode != 0:
-        return ImageStatus(image=image, pulled=False, error=(result.stderr or result.stdout).strip())
-    return ImageStatus(image=image, pulled=True, detail="Image is present locally")
+        raise RuntimeError((result.stderr or result.stdout).strip())
+
+    images: list[str] = []
+    for raw_line in result.stdout.splitlines():
+        try:
+            image = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+
+        repository = str(image.get("Repository", "")).strip()
+        tag = str(image.get("Tag", "")).strip()
+        if not repository or repository == "<none>" or not tag or tag == "<none>":
+            continue
+
+        full_name = f"{repository}:{tag}"
+        if "vllm" in full_name.lower() and full_name not in images:
+            images.append(full_name)
+    return sorted(images)
+
+
+def vllm_image_status(docker: ToolStatus) -> ImageStatus:
+    if not docker.available:
+        return ImageStatus(pulled=False, error="Docker is not available")
+
+    configured_image = configured_vllm_docker_image()
+    try:
+        images = local_vllm_images()
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return ImageStatus(image=configured_image, pulled=False, error=str(exc))
+
+    if configured_image:
+        if configured_image in images:
+            return ImageStatus(image=configured_image, images=images, pulled=True, detail="Configured image is present locally")
+        return ImageStatus(
+            image=configured_image,
+            images=images,
+            pulled=False,
+            error=f"Configured image was not found locally. Discovered {len(images)} vLLM image{'s' if len(images) != 1 else ''}.",
+        )
+
+    if not images:
+        return ImageStatus(pulled=False, error="No local Docker images with 'vllm' in the repository or tag were found")
+    return ImageStatus(image=images[0], images=images, pulled=True, detail=f"Discovered {len(images)} local vLLM image{'s' if len(images) != 1 else ''}")
 
 
 def gpu_status() -> GpuStatus:
@@ -352,7 +387,7 @@ def config_status() -> ConfigStatus:
     docker = docker_status()
     return ConfigStatus(
         docker=docker,
-        vllm_image=vllm_image_status(vllm_docker_image(), docker),
+        vllm_image=vllm_image_status(docker),
         gpu=gpu_status(),
     )
 
