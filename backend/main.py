@@ -2,6 +2,8 @@ import base64
 import io
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -70,6 +72,36 @@ class VllmMetrics(BaseModel):
     error: str = ""
 
 
+class VllmHealth(BaseModel):
+    available: bool = True
+    error: str = ""
+
+
+class ToolStatus(BaseModel):
+    available: bool = False
+    detail: str = ""
+    error: str = ""
+
+
+class ImageStatus(BaseModel):
+    image: str
+    pulled: bool = False
+    detail: str = ""
+    error: str = ""
+
+
+class GpuStatus(BaseModel):
+    detected: bool = False
+    devices: list[str] = []
+    error: str = ""
+
+
+class ConfigStatus(BaseModel):
+    docker: ToolStatus
+    vllm_image: ImageStatus
+    gpu: GpuStatus
+
+
 def openai_settings() -> OpenAISettings:
     load_dotenv(ENV_PATH, override=True)
     return OpenAISettings(
@@ -84,6 +116,66 @@ def vllm_metrics_url(base_url: str) -> str:
     if root.endswith("/v1"):
         root = root[:-3]
     return urljoin(f"{root}/", "metrics")
+
+
+def vllm_health_url(base_url: str) -> str:
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    return urljoin(f"{root}/", "health")
+
+
+def vllm_docker_image() -> str:
+    load_dotenv(ENV_PATH, override=True)
+    return os.getenv("VLLM_DOCKER_IMAGE", "vllm/vllm-openai:latest")
+
+
+def run_command(command: list[str], timeout: int = 5) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, capture_output=True, check=False, text=True, timeout=timeout)
+
+
+def docker_status() -> ToolStatus:
+    if shutil.which("docker") is None:
+        return ToolStatus(available=False, error="docker command not found")
+
+    try:
+        result = run_command(["docker", "--version"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return ToolStatus(available=False, error=str(exc))
+
+    if result.returncode != 0:
+        return ToolStatus(available=False, error=(result.stderr or result.stdout).strip())
+    return ToolStatus(available=True, detail=result.stdout.strip())
+
+
+def vllm_image_status(image: str, docker: ToolStatus) -> ImageStatus:
+    if not docker.available:
+        return ImageStatus(image=image, pulled=False, error="Docker is not available")
+
+    try:
+        result = run_command(["docker", "image", "inspect", image])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return ImageStatus(image=image, pulled=False, error=str(exc))
+
+    if result.returncode != 0:
+        return ImageStatus(image=image, pulled=False, error=(result.stderr or result.stdout).strip())
+    return ImageStatus(image=image, pulled=True, detail="Image is present locally")
+
+
+def gpu_status() -> GpuStatus:
+    if shutil.which("nvidia-smi") is None:
+        return GpuStatus(detected=False, error="nvidia-smi command not found")
+
+    try:
+        result = run_command(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return GpuStatus(detected=False, error=str(exc))
+
+    if result.returncode != 0:
+        return GpuStatus(detected=False, error=(result.stderr or result.stdout).strip())
+
+    devices = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return GpuStatus(detected=bool(devices), devices=devices, error="" if devices else "No NVIDIA GPU reported")
 
 
 def prometheus_metric_value(metrics_text: str, metric_name: str) -> float | None:
@@ -255,6 +347,16 @@ def settings() -> dict[str, Any]:
     return {"openai": {"base_url": openai.base_url, "model": openai.model}}
 
 
+@app.get("/api/config", response_model=ConfigStatus)
+def config_status() -> ConfigStatus:
+    docker = docker_status()
+    return ConfigStatus(
+        docker=docker,
+        vllm_image=vllm_image_status(vllm_docker_image(), docker),
+        gpu=gpu_status(),
+    )
+
+
 @app.get("/api/vllm-metrics", response_model=VllmMetrics)
 async def vllm_metrics() -> VllmMetrics:
     settings = openai_settings()
@@ -270,6 +372,20 @@ async def vllm_metrics() -> VllmMetrics:
         num_requests_running=prometheus_metric_value(response.text, "vllm:num_requests_running"),
         num_requests_waiting=prometheus_metric_value(response.text, "vllm:num_requests_waiting"),
     )
+
+
+@app.get("/api/vllm", response_model=VllmHealth)
+async def vllm_health() -> VllmHealth:
+    settings = openai_settings()
+    health_url = vllm_health_url(settings.base_url)
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            response = await client.get(health_url)
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        return VllmHealth(available=False, error=str(exc))
+
+    return VllmHealth()
 
 
 @app.post("/api/extract", response_model=ExtractionResult)

@@ -1,4 +1,5 @@
 # Local config and secrets
+deploy.sh
 .env
 .env.*
 backend/.env
