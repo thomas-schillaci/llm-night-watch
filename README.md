@@ -1,25 +1,35 @@
 # LLM Night Watch
 
-Vite React frontend plus FastAPI backend for document extraction review.
+### The self-hosted AI stack that continuously improves itself
 
-## Run
+![status](https://img.shields.io/badge/status-early-orange)
+![license](https://img.shields.io/badge/license-MIT-blue)
+
+Exists next to your self-hosted LLM, re-checks outputs during low gpu utilization to continuously improve the model.
+
+## Quickstart
 
 ```bash
-pip install -r requirements.txt
-npm install
+npm i
+cp backend/.env.template backend/.env   # then edit
 npm run dev
 ```
 
-Copy `backend/.env.template` to `backend/.env`, then configure the OpenAI-compatible backend:
+## Example
 
-- `OPENAI_BASE_URL=...`
-- `OPENAI_API_KEY=...`
-- `OPENAI_MODEL=...`
+In the manual tab, upload a PDF, specify the fields you want to extract. The backend renders page 1, converts it to a B/W JPEG, base64-encodes it, and calls the chat-completions endpoint with the frontend's prompt and response format (temperature `0`, 512 max tokens).
 
-`backend/.env` is intentionally ignored by git.
+The frontend sends a **100 DPI** request first for a fast result, then a **200 DPI** request, switching the review view to the verified result. Fast pass for speed, heavier pass for confidence.
 
-## Flow
+## Roadmap
 
-The browser uploads the PDF only to `/api/extract`. The backend renders page 1 at the requested DPI, converts it to black-and-white JPEG quality 80, base64-encodes it, and calls the OpenAI-compatible chat completions endpoint with the prompt and response format supplied by the frontend. The request uses temperature `0` and max tokens `512`.
+- Idle-GPU verification: run an agentic workflow on spare capacity to verify predictions
+- Output-quality detection: auto-flag anomalous outputs
+- Beyond extraction: generalize the loop to other open-weight workloads
 
-The frontend sends a 100 DPI request first. Once it returns, it automatically sends a 200 DPI request and switches the review view to that result.
+## Contact
+
+Running open-weight inference in production? I want to hear what you're running.
+[@tschillaciml](https://x.com/tschillaciml)
+
+🌟 Leave a star if this is helpful!
