@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import fitz
 import httpx
@@ -35,6 +36,7 @@ class RenderedPrompt(BaseModel):
 
 class ProcessedImage(BaseModel):
     dpi: int
+    first_n_pages: int
     mime_type: str
     width: int
     height: int
@@ -44,6 +46,7 @@ class ProcessedImage(BaseModel):
 
 class ExtractionResult(BaseModel):
     dpi: int
+    first_n_pages: int
     prompt: RenderedPrompt
     processed_image: ProcessedImage
     request: dict[str, Any]
@@ -60,6 +63,13 @@ class OpenAISettings(BaseModel):
     model: str
 
 
+class VllmMetrics(BaseModel):
+    num_requests_running: float | None = None
+    num_requests_waiting: float | None = None
+    available: bool = True
+    error: str = ""
+
+
 def openai_settings() -> OpenAISettings:
     load_dotenv(ENV_PATH, override=True)
     return OpenAISettings(
@@ -69,7 +79,33 @@ def openai_settings() -> OpenAISettings:
     )
 
 
-def render_first_page_jpeg(pdf_bytes: bytes, dpi: int) -> ProcessedImage:
+def vllm_metrics_url(base_url: str) -> str:
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    return urljoin(f"{root}/", "metrics")
+
+
+def prometheus_metric_value(metrics_text: str, metric_name: str) -> float | None:
+    total = 0.0
+    found = False
+    prefix = f"{metric_name}"
+    for raw_line in metrics_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or not line.startswith(prefix):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            total += float(parts[1])
+        except ValueError:
+            continue
+        found = True
+    return total if found else None
+
+
+def render_pages_jpeg(pdf_bytes: bytes, dpi: int, first_n_pages: int) -> ProcessedImage:
     try:
         document = fitz.open(stream=pdf_bytes, filetype="pdf")
     except Exception as exc:
@@ -78,20 +114,32 @@ def render_first_page_jpeg(pdf_bytes: bytes, dpi: int) -> ProcessedImage:
     if document.page_count < 1:
         raise HTTPException(status_code=400, detail="PDF has no pages")
 
-    page = document.load_page(0)
-    pixmap = page.get_pixmap(dpi=dpi, alpha=False)
-    image = Image.open(io.BytesIO(pixmap.tobytes("png")))
-    grayscale = image.convert("L")
-    thresholded = grayscale.point(lambda px: 255 if px >= 180 else 0, mode="1").convert("L")
+    page_count = min(first_n_pages, document.page_count)
+    rendered_pages: list[Image.Image] = []
+    for page_index in range(page_count):
+        page = document.load_page(page_index)
+        pixmap = page.get_pixmap(dpi=dpi, alpha=False)
+        image = Image.open(io.BytesIO(pixmap.tobytes("png")))
+        grayscale = image.convert("L")
+        rendered_pages.append(grayscale.point(lambda px: 255 if px >= 180 else 0, mode="1").convert("L"))
+
+    combined_width = max(page.width for page in rendered_pages)
+    combined_height = sum(page.height for page in rendered_pages)
+    combined = Image.new("L", (combined_width, combined_height), 255)
+    y_offset = 0
+    for page in rendered_pages:
+        combined.paste(page, (0, y_offset))
+        y_offset += page.height
 
     output = io.BytesIO()
-    thresholded.save(output, format="JPEG", quality=80, optimize=True)
+    combined.save(output, format="JPEG", quality=80, optimize=True)
     encoded = base64.b64encode(output.getvalue()).decode("ascii")
     return ProcessedImage(
         dpi=dpi,
+        first_n_pages=page_count,
         mime_type="image/jpeg",
-        width=thresholded.width,
-        height=thresholded.height,
+        width=combined.width,
+        height=combined.height,
         base64=encoded,
         data_url=f"data:image/jpeg;base64,{encoded}",
     )
@@ -207,15 +255,35 @@ def settings() -> dict[str, Any]:
     return {"openai": {"base_url": openai.base_url, "model": openai.model}}
 
 
+@app.get("/api/vllm-metrics", response_model=VllmMetrics)
+async def vllm_metrics() -> VllmMetrics:
+    settings = openai_settings()
+    metrics_url = vllm_metrics_url(settings.base_url)
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            response = await client.get(metrics_url)
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        return VllmMetrics(available=False, error=str(exc))
+
+    return VllmMetrics(
+        num_requests_running=prometheus_metric_value(response.text, "vllm:num_requests_running"),
+        num_requests_waiting=prometheus_metric_value(response.text, "vllm:num_requests_waiting"),
+    )
+
+
 @app.post("/api/extract", response_model=ExtractionResult)
 async def extract(
     file: UploadFile = File(...),
     dpi: int = Form(100),
+    first_n_pages: int = Form(1),
     prompt: str = Form(...),
     response_format: str = Form(...),
 ) -> ExtractionResult:
-    if dpi not in (100, 200):
-        raise HTTPException(status_code=400, detail="dpi must be 100 or 200")
+    if dpi < 50 or dpi > 400:
+        raise HTTPException(status_code=400, detail="dpi must be between 50 and 400")
+    if first_n_pages < 1 or first_n_pages > 10:
+        raise HTTPException(status_code=400, detail="first_n_pages must be between 1 and 10")
     if file.content_type not in {"application/pdf", "application/octet-stream"}:
         raise HTTPException(status_code=400, detail="Upload a PDF")
     if not prompt.strip():
@@ -224,7 +292,7 @@ async def extract(
     parsed_response_format = parse_response_format(response_format)
     pdf_bytes = await file.read()
     rendered_prompt = RenderedPrompt(text=prompt)
-    image = render_first_page_jpeg(pdf_bytes, dpi)
+    image = render_pages_jpeg(pdf_bytes, dpi, first_n_pages)
     settings = openai_settings()
     request_body = build_request(rendered_prompt.text, image, parsed_response_format, settings)
 
@@ -246,6 +314,7 @@ async def extract(
     extracted, validation_errors, message = validate_extracted(parsed, parsed_response_format)
     return ExtractionResult(
         dpi=dpi,
+        first_n_pages=image.first_n_pages,
         prompt=rendered_prompt,
         processed_image=image,
         request=request_body,

@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently --kill-others --names backend,frontend --prefix-colors cyan,green \"npm run dev:backend\" \"npm run dev:frontend\"",
-    "dev:backend": "python3 -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload",
+    "dev:backend": "uv run --with-requirements requirements.txt uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload",
     "dev:frontend": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
