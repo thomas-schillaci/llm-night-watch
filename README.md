@@ -4,6 +4,8 @@
 
 ![status](https://img.shields.io/badge/status-early-orange)
 ![license](https://img.shields.io/badge/license-MIT-blue)
+<img src="https://img.shields.io/twitter/follow/tschillaciML?logo=X&color=%20%23f5f5f5"
+      alt="follow on X(Twitter)"></a>
 
 Exists next to your self-hosted LLM, re-checks outputs during low gpu utilization to continuously improve the model.
 
