@@ -1,0 +1,18 @@
+[project]
+name = "llm-night-watch"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.0",
+  "httpx>=0.27.0",
+  "jsonschema>=4.23.0",
+  "pillow>=10.4.0",
+  "pydantic>=2.8.0",
+  "pymupdf>=1.24.9",
+  "python-multipart>=0.0.9",
+  "python-dotenv>=1.0.1",
+  "uvicorn[standard]>=0.30.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
