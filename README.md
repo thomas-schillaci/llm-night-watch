@@ -9,20 +9,20 @@
 
 Exists next to your self-hosted LLM, re-checks outputs during low gpu utilization to continuously improve the model.
 
-## Architecture
-
-```mermaid
-flowchart LR
-  frontend["Frontend\nReact + Vite"] <--> backend["Backend\nFastAPI"]
-  backend <--> vllm["vLLM server\nOpenAI-compatible API"]
-```
-
 ## Quickstart
 
 ```bash
 npm i
 cp backend/.env.template backend/.env   # then edit
 npm run dev
+```
+
+## Architecture
+
+```mermaid
+flowchart LR
+  frontend["Frontend\nReact + Vite"] <--> backend["Backend\nFastAPI"]
+  backend <--> vllm["vLLM server\nOpenAI-compatible API"]
 ```
 
 ## Example
