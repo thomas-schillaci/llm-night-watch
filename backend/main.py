@@ -1,26 +1,28 @@
 import base64
 import io
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import fitz
 import httpx
 import jsonschema
-from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 APP_DIR = Path(__file__).resolve().parent
-ENV_PATH = APP_DIR / ".env"
-load_dotenv(ENV_PATH, override=True)
+PROJECT_DIR = APP_DIR.parent
+CONFIG_PATH = PROJECT_DIR / "llm-night-watch.config.json"
+DEFAULT_VLLM_URL = "http://localhost:8000"
+DEFAULT_VLLM_MODEL = "auto"
+DEFAULT_VLLM_API_KEY = "EMPTY"
+DEFAULT_VLLM_IMAGE = "vllm/vllm-openai:latest"
 
 app = FastAPI(title="LLM Night Watch")
 app.add_middleware(
@@ -65,6 +67,26 @@ class OpenAISettings(BaseModel):
     model: str
 
 
+class VllmConfig(BaseModel):
+    url: str = DEFAULT_VLLM_URL
+    model: str = DEFAULT_VLLM_MODEL
+    api_key: str = DEFAULT_VLLM_API_KEY
+    image: str = DEFAULT_VLLM_IMAGE
+
+
+class AppConfig(BaseModel):
+    vllm: VllmConfig = Field(default_factory=VllmConfig)
+
+
+class VllmModelStatus(BaseModel):
+    configured: str = DEFAULT_VLLM_MODEL
+    resolved: str = ""
+    auto_detect: bool = True
+    models: list[str] = []
+    detail: str = ""
+    error: str = ""
+
+
 class VllmMetrics(BaseModel):
     num_requests_running: float | None = None
     num_requests_waiting: float | None = None
@@ -77,20 +99,6 @@ class VllmHealth(BaseModel):
     error: str = ""
 
 
-class ToolStatus(BaseModel):
-    available: bool = False
-    detail: str = ""
-    error: str = ""
-
-
-class ImageStatus(BaseModel):
-    image: str = ""
-    images: list[str] = []
-    pulled: bool = False
-    detail: str = ""
-    error: str = ""
-
-
 class GpuStatus(BaseModel):
     detected: bool = False
     devices: list[str] = []
@@ -98,17 +106,109 @@ class GpuStatus(BaseModel):
 
 
 class ConfigStatus(BaseModel):
-    docker: ToolStatus
-    vllm_image: ImageStatus
+    app_config: AppConfig
+    model: VllmModelStatus
     gpu: GpuStatus
 
 
-def openai_settings() -> OpenAISettings:
-    load_dotenv(ENV_PATH, override=True)
+def normalize_vllm_url(url: str) -> str:
+    normalized = url.strip().rstrip("/")
+    if normalized.endswith("/v1"):
+        normalized = normalized[:-3].rstrip("/")
+    return normalized or DEFAULT_VLLM_URL
+
+
+def resolve_vllm_url(vllm_url: str, backend_base_url: str | None = None) -> str:
+    normalized = normalize_vllm_url(vllm_url)
+    parsed = urlparse(normalized)
+    if parsed.scheme and parsed.netloc:
+        return normalized
+    if backend_base_url:
+        return urljoin(str(backend_base_url), normalized)
+    return normalized
+
+
+def vllm_api_base_url(vllm_url: str, backend_base_url: str | None = None) -> str:
+    return urljoin(f"{resolve_vllm_url(vllm_url, backend_base_url).rstrip('/')}/", "v1")
+
+
+def normalize_app_config(config: AppConfig) -> AppConfig:
+    config.vllm.url = normalize_vllm_url(config.vllm.url)
+    config.vllm.model = config.vllm.model.strip() or DEFAULT_VLLM_MODEL
+    config.vllm.api_key = config.vllm.api_key.strip() or DEFAULT_VLLM_API_KEY
+    config.vllm.image = config.vllm.image.strip() or DEFAULT_VLLM_IMAGE
+    return config
+
+
+def read_app_config() -> AppConfig:
+    if not CONFIG_PATH.exists():
+        return AppConfig()
+
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return normalize_app_config(AppConfig.model_validate(raw))
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read config file: {exc}") from exc
+
+
+def write_app_config(config: AppConfig) -> AppConfig:
+    normalized = normalize_app_config(config)
+    try:
+        CONFIG_PATH.write_text(normalized.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not write config file: {exc}") from exc
+    return normalized
+
+
+async def detect_vllm_models(config: AppConfig, backend_base_url: str | None = None) -> list[str]:
+    models_url = urljoin(f"{vllm_api_base_url(config.vllm.url, backend_base_url).rstrip('/')}/", "models")
+    async with httpx.AsyncClient(timeout=5) as client:
+        response = await client.get(models_url, headers={"Authorization": f"Bearer {config.vllm.api_key}"})
+        response.raise_for_status()
+
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+
+    models: list[str] = []
+    for item in data:
+        if isinstance(item, dict):
+            model_id = str(item.get("id", "")).strip()
+            if model_id:
+                models.append(model_id)
+    return models
+
+
+async def vllm_model_status(config: AppConfig, backend_base_url: str | None = None) -> VllmModelStatus:
+    configured = config.vllm.model.strip() or DEFAULT_VLLM_MODEL
+    auto_detect = configured.lower() == "auto"
+    if not auto_detect:
+        return VllmModelStatus(configured=configured, resolved=configured, auto_detect=False, detail="Using configured model")
+
+    try:
+        models = await detect_vllm_models(config, backend_base_url)
+    except httpx.HTTPError as exc:
+        return VllmModelStatus(configured=configured, auto_detect=True, error=str(exc))
+
+    if not models:
+        return VllmModelStatus(configured=configured, auto_detect=True, error="/v1/models returned no model ids")
+    return VllmModelStatus(configured=configured, resolved=models[0], auto_detect=True, models=models, detail=f"Auto-detected {models[0]}")
+
+
+async def resolve_vllm_model(config: AppConfig, backend_base_url: str | None = None) -> str:
+    status = await vllm_model_status(config, backend_base_url)
+    if status.resolved:
+        return status.resolved
+    raise HTTPException(status_code=502, detail=f"Could not auto-detect vLLM model: {status.error or 'unknown error'}")
+
+
+async def openai_settings(backend_base_url: str | None = None) -> OpenAISettings:
+    config = read_app_config()
     return OpenAISettings(
-        base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:8001/v1"),
-        api_key=os.getenv("OPENAI_API_KEY", "change-me"),
-        model=os.getenv("OPENAI_MODEL", "change-me"),
+        base_url=vllm_api_base_url(config.vllm.url, backend_base_url),
+        api_key=config.vllm.api_key,
+        model=await resolve_vllm_model(config, backend_base_url),
     )
 
 
@@ -126,75 +226,9 @@ def vllm_health_url(base_url: str) -> str:
     return urljoin(f"{root}/", "health")
 
 
-def configured_vllm_docker_image() -> str:
-    load_dotenv(ENV_PATH, override=True)
-    return os.getenv("VLLM_DOCKER_IMAGE", "").strip()
-
 
 def run_command(command: list[str], timeout: int = 5) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, check=False, text=True, timeout=timeout)
-
-
-def docker_status() -> ToolStatus:
-    if shutil.which("docker") is None:
-        return ToolStatus(available=False, error="docker command not found")
-
-    try:
-        result = run_command(["docker", "--version"])
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return ToolStatus(available=False, error=str(exc))
-
-    if result.returncode != 0:
-        return ToolStatus(available=False, error=(result.stderr or result.stdout).strip())
-    return ToolStatus(available=True, detail=result.stdout.strip())
-
-
-def local_vllm_images() -> list[str]:
-    result = run_command(["docker", "image", "ls", "--format", "{{json .}}"])
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout).strip())
-
-    images: list[str] = []
-    for raw_line in result.stdout.splitlines():
-        try:
-            image = json.loads(raw_line)
-        except json.JSONDecodeError:
-            continue
-
-        repository = str(image.get("Repository", "")).strip()
-        tag = str(image.get("Tag", "")).strip()
-        if not repository or repository == "<none>" or not tag or tag == "<none>":
-            continue
-
-        full_name = f"{repository}:{tag}"
-        if "vllm" in full_name.lower() and full_name not in images:
-            images.append(full_name)
-    return sorted(images)
-
-
-def vllm_image_status(docker: ToolStatus) -> ImageStatus:
-    if not docker.available:
-        return ImageStatus(pulled=False, error="Docker is not available")
-
-    configured_image = configured_vllm_docker_image()
-    try:
-        images = local_vllm_images()
-    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
-        return ImageStatus(image=configured_image, pulled=False, error=str(exc))
-
-    if configured_image:
-        if configured_image in images:
-            return ImageStatus(image=configured_image, images=images, pulled=True, detail="Configured image is present locally")
-        return ImageStatus(
-            image=configured_image,
-            images=images,
-            pulled=False,
-            error=f"Configured image was not found locally. Discovered {len(images)} vLLM image{'s' if len(images) != 1 else ''}.",
-        )
-
-    if not images:
-        return ImageStatus(pulled=False, error="No local Docker images with 'vllm' in the repository or tag were found")
-    return ImageStatus(image=images[0], images=images, pulled=True, detail=f"Discovered {len(images)} local vLLM image{'s' if len(images) != 1 else ''}")
 
 
 def gpu_status() -> GpuStatus:
@@ -377,24 +411,34 @@ def validate_extracted(parsed: dict[str, Any], response_format: dict[str, Any]) 
 
 
 @app.get("/api/settings")
-def settings() -> dict[str, Any]:
-    openai = openai_settings()
+async def settings(request: Request) -> dict[str, Any]:
+    openai = await openai_settings(str(request.base_url))
     return {"openai": {"base_url": openai.base_url, "model": openai.model}}
 
 
 @app.get("/api/config", response_model=ConfigStatus)
-def config_status() -> ConfigStatus:
-    docker = docker_status()
+async def config_status(request: Request) -> ConfigStatus:
+    config = read_app_config()
     return ConfigStatus(
-        docker=docker,
-        vllm_image=vllm_image_status(docker),
+        app_config=config,
+        model=await vllm_model_status(config, str(request.base_url)),
+        gpu=gpu_status(),
+    )
+
+
+@app.put("/api/config", response_model=ConfigStatus)
+async def update_config(config: AppConfig, request: Request) -> ConfigStatus:
+    saved = write_app_config(config)
+    return ConfigStatus(
+        app_config=saved,
+        model=await vllm_model_status(saved, str(request.base_url)),
         gpu=gpu_status(),
     )
 
 
 @app.get("/api/vllm-metrics", response_model=VllmMetrics)
-async def vllm_metrics() -> VllmMetrics:
-    settings = openai_settings()
+async def vllm_metrics(request: Request) -> VllmMetrics:
+    settings = await openai_settings(str(request.base_url))
     metrics_url = vllm_metrics_url(settings.base_url)
     try:
         async with httpx.AsyncClient(timeout=3) as client:
@@ -410,8 +454,8 @@ async def vllm_metrics() -> VllmMetrics:
 
 
 @app.get("/api/vllm", response_model=VllmHealth)
-async def vllm_health() -> VllmHealth:
-    settings = openai_settings()
+async def vllm_health(request: Request) -> VllmHealth:
+    settings = await openai_settings(str(request.base_url))
     health_url = vllm_health_url(settings.base_url)
     try:
         async with httpx.AsyncClient(timeout=3) as client:
@@ -425,6 +469,7 @@ async def vllm_health() -> VllmHealth:
 
 @app.post("/api/extract", response_model=ExtractionResult)
 async def extract(
+    request: Request,
     file: UploadFile = File(...),
     dpi: int = Form(100),
     first_n_pages: int = Form(1),
@@ -444,7 +489,7 @@ async def extract(
     pdf_bytes = await file.read()
     rendered_prompt = RenderedPrompt(text=prompt)
     image = render_pages_jpeg(pdf_bytes, dpi, first_n_pages)
-    settings = openai_settings()
+    settings = await openai_settings(str(request.base_url))
     request_body = build_request(rendered_prompt.text, image, parsed_response_format, settings)
 
     try:

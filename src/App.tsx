@@ -58,7 +58,7 @@ export function App() {
   return (
     <main className="min-h-screen bg-background text-foreground">
       <AppHeader activeTab={activeTab} onTabChange={setActiveTab} metrics={vllmMetrics} health={vllmHealth} />
-      {activeTab === "config" ? <ConfigTab config={configStatus} error={configError} /> : null}
+      {activeTab === "config" ? <ConfigTab config={configStatus} error={configError} onConfigSaved={setConfigStatus} /> : null}
       {activeTab === "manual-request" ? <ManualRequestTab /> : null}
     </main>
   );

@@ -19,6 +19,25 @@ export type ResponseFormatMode = "fields" | "raw";
 export type ExtractionParams = { dpi: number; first_n_pages: number };
 export type AppTab = "config" | "manual-request";
 
+
+export type AppConfig = {
+  vllm: {
+    url: string;
+    model: string;
+    api_key: string;
+    image: string;
+  };
+};
+
+export type VllmModelStatus = {
+  configured: string;
+  resolved: string;
+  auto_detect: boolean;
+  models: string[];
+  detail: string;
+  error: string;
+};
+
 export type VllmMetrics = {
   num_requests_running: number | null;
   num_requests_waiting: number | null;
@@ -32,7 +51,7 @@ export type VllmHealth = {
 };
 
 export type ConfigStatus = {
-  docker: { available: boolean; detail: string; error: string };
-  vllm_image: { image: string; images: string[]; pulled: boolean; detail: string; error: string };
+  app_config: AppConfig;
+  model: VllmModelStatus;
   gpu: { detected: boolean; devices: string[]; error: string };
 };

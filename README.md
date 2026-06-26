@@ -13,7 +13,6 @@ Exists next to your self-hosted LLM, re-checks outputs during low gpu utilizatio
 
 ```bash
 npm i
-cp backend/.env.template backend/.env   # then edit
 npm run dev
 ```
 
@@ -21,13 +20,14 @@ npm run dev
 
 ```mermaid
 flowchart LR
-  frontend["Frontend\nReact + Vite"] <--> backend["Backend\nFastAPI"]
+  workload["Your AI workload"] <--> backend["Backend\nFastAPI"]
+  frontend["Frontend\nReact + Vite"] <--> backend
   backend <--> vllm["vLLM server\nOpenAI-compatible API"]
 ```
 
 ## Example
 
-In the manual tab, upload a PDF, specify the fields you want to extract. The backend renders page 1, converts it to a B/W JPEG, base64-encodes it, and calls the chat-completions endpoint with the frontend's prompt and response format (temperature `0`, 512 max tokens).
+In the config tab, set the vLLM URL and model (`auto` detects from `/v1/models`). In the manual tab, upload a PDF, specify the fields you want to extract. The backend renders page 1, converts it to a B/W JPEG, base64-encodes it, and calls the chat-completions endpoint with the frontend's prompt and response format (temperature `0`, 512 max tokens).
 
 The frontend sends a **100 DPI** request first for a fast result, then a **200 DPI** request, switching the review view to the verified result. Fast pass for speed, heavier pass for confidence.
 

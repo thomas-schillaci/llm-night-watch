@@ -1,5 +1,6 @@
-import { ConfigStatus, ExtractionParams, ExtractionResult, VllmHealth, VllmMetrics } from "./types";
+import { AppConfig, ConfigStatus, ExtractionParams, ExtractionResult, VllmHealth, VllmMetrics } from "./types";
 import { stringify } from "./extractionUtils";
+
 
 function errorMessageFromPayload(payload: unknown): string {
   if (payload && typeof payload === "object" && "detail" in payload) {
@@ -45,4 +46,20 @@ export async function fetchConfigStatus(): Promise<ConfigStatus> {
   const response = await fetch("/api/config");
   if (!response.ok) throw new Error(`Config request failed: ${response.status}`);
   return (await response.json()) as ConfigStatus;
+}
+
+export async function updateConfig(config: AppConfig): Promise<ConfigStatus> {
+  const response = await fetch("/api/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config),
+  });
+  const contentType = response.headers.get("content-type") ?? "";
+  const payload = contentType.includes("application/json") ? await response.json() : await response.text();
+
+  if (!response.ok) {
+    throw new Error(errorMessageFromPayload(payload));
+  }
+
+  return payload as ConfigStatus;
 }
