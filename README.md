@@ -2,6 +2,8 @@
 
 ### The self-hosted AI stack that continuously improves itself
 
+![cover](./cover.png)
+
 ![status](https://img.shields.io/badge/status-early-orange)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 <img src="https://img.shields.io/twitter/follow/tschillaciML?logo=X&color=%20%23f5f5f5"
