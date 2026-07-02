@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import sqlite3
 from pathlib import Path
@@ -5,6 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from backend import main
 
@@ -43,6 +46,43 @@ def records(db_path: Path) -> list[sqlite3.Row]:
     with sqlite3.connect(db_path) as connection:
         connection.row_factory = sqlite3.Row
         return list(connection.execute("SELECT * FROM openai_request_tee ORDER BY id"))
+
+
+def make_data_url(width: int, height: int) -> str:
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), color="red").save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def image_size_from_data_url(data_url: str) -> tuple[int, int]:
+    encoded = data_url.split(",", 1)[1]
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+        return image.size
+
+
+def write_config_with_max_mp(path: Path, db_path: Path, max_mp: float) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "vllm": {
+                    "url": "http://upstream",
+                    "model": "auto",
+                    "api_key": "configured-key",
+                    "image": "vllm/vllm-openai:latest",
+                },
+                "proxy": {
+                    "base_url": "http://upstream",
+                    "api_key": "configured-key",
+                    "capture_bodies": True,
+                    "max_body_bytes": 1_000_000,
+                    "db_path": str(db_path),
+                },
+                "optimization": {"max_mp": max_mp},
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_config_test_endpoint_reports_models(monkeypatch, tmp_path):
@@ -363,3 +403,139 @@ def test_request_history_lists_active_and_saved(monkeypatch, tmp_path):
     assert payload["saved"][0]["request_id"] == "saved-1"
     assert payload["saved"][0]["running"] is False
     assert payload["saved"][0]["response_body"] == '{"ok":true}'
+
+
+def test_large_images_are_downscaled_to_max_megapixels(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    db_path = tmp_path / "tee.sqlite3"
+    write_config_with_max_mp(config_path, db_path, max_mp=2.3)
+
+    oversized = make_data_url(2550, 3611)
+    forwarded_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        url = body["messages"][0]["content"][1]["image_url"]["url"]
+        forwarded_urls.append(url)
+        return httpx.Response(200, json={"id": "chatcmpl_1", "choices": []})
+
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    main.app.state.upstream_transport = httpx.MockTransport(handler)
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "night-model",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "hi"},
+                            {"type": "image_url", "image_url": {"url": oversized}},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert forwarded_urls[0] != oversized
+    width, height = image_size_from_data_url(forwarded_urls[0])
+    assert width * height <= 2.3 * 1_000_000
+    assert width / height == pytest.approx(2550 / 3611, rel=1e-3)
+
+    [record] = records(db_path)
+    logged_url = json.loads(record["request_body"])["messages"][0]["content"][1]["image_url"]["url"]
+    assert logged_url == forwarded_urls[0]
+    original_logged_url = json.loads(record["original_request_body"])["messages"][0]["content"][1]["image_url"]["url"]
+    assert original_logged_url == oversized
+
+
+def test_images_within_mp_limit_are_untouched(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    db_path = tmp_path / "tee.sqlite3"
+    write_config_with_max_mp(config_path, db_path, max_mp=2.3)
+
+    small = make_data_url(200, 100)
+    forwarded_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        forwarded_urls.append(body["messages"][0]["content"][0]["image_url"]["url"])
+        return httpx.Response(200, json={"id": "chatcmpl_1", "choices": []})
+
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    main.app.state.upstream_transport = httpx.MockTransport(handler)
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "night-model",
+                "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": small}}]}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert forwarded_urls[0] == small
+
+
+def test_default_config_downscales_to_2_3_megapixels(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    db_path = tmp_path / "tee.sqlite3"
+    write_config(config_path, db_path)
+
+    oversized = make_data_url(2550, 3611)
+    forwarded_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        forwarded_urls.append(body["messages"][0]["content"][0]["image_url"]["url"])
+        return httpx.Response(200, json={"id": "chatcmpl_1", "choices": []})
+
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    main.app.state.upstream_transport = httpx.MockTransport(handler)
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "night-model",
+                "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": oversized}}]}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert forwarded_urls[0] != oversized
+    width, height = image_size_from_data_url(forwarded_urls[0])
+    assert width * height <= 2.3 * 1_000_000
+
+
+def test_max_mp_zero_disables_optimization(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    db_path = tmp_path / "tee.sqlite3"
+    write_config_with_max_mp(config_path, db_path, max_mp=0)
+
+    oversized = make_data_url(2550, 3611)
+    forwarded_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        forwarded_urls.append(body["messages"][0]["content"][0]["image_url"]["url"])
+        return httpx.Response(200, json={"id": "chatcmpl_1", "choices": []})
+
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    main.app.state.upstream_transport = httpx.MockTransport(handler)
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "night-model",
+                "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": oversized}}]}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert forwarded_urls[0] == oversized

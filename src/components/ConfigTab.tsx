@@ -49,10 +49,15 @@ type ValidationConfig = {
   fields: SchemaField[];
 };
 
+type OptimizationConfig = {
+  max_mp: number;
+};
+
 type AppConfig = {
   vllm: VllmConfig;
   proxy: ProxyConfig;
   validation: ValidationConfig;
+  optimization: OptimizationConfig;
 };
 
 type ConfigStatus = {
@@ -85,6 +90,9 @@ const defaultConfig: AppConfig = {
   validation: {
     fields: [],
   },
+  optimization: {
+    max_mp: 2.3,
+  },
 };
 
 type ValidatorEditorProps = {
@@ -108,7 +116,7 @@ function ValidatorEditor({ code, onChange }: ValidatorEditorProps) {
       />
       <p className="text-xs text-muted-foreground">
         Python body of a field_validator(cls, v) classmethod (the `re` module is available). Raise ValueError to
-        flag the response; return v (or nothing) to pass.
+        flag the response; return the validated value.
       </p>
     </div>
   );
@@ -137,6 +145,10 @@ export function ConfigTab() {
   const isValidationDirty = useMemo(
     () => JSON.stringify(config.validation) !== JSON.stringify(savedConfig.validation),
     [config.validation, savedConfig.validation],
+  );
+  const isOptimizationDirty = useMemo(
+    () => JSON.stringify(config.optimization) !== JSON.stringify(savedConfig.optimization),
+    [config.optimization, savedConfig.optimization],
   );
 
   const loadConfig = useCallback(async (signal?: AbortSignal) => {
@@ -170,6 +182,16 @@ export function ConfigTab() {
       ...current,
       proxy: {
         ...current.proxy,
+        [field]: value,
+      },
+    }));
+  }
+
+  function updateOptimizationField<K extends keyof OptimizationConfig>(field: K, value: OptimizationConfig[K]) {
+    setConfig((current) => ({
+      ...current,
+      optimization: {
+        ...current.optimization,
         [field]: value,
       },
     }));
@@ -450,6 +472,36 @@ export function ConfigTab() {
               Add field
             </Button>
             <Button disabled={busy || !isValidationDirty} onClick={saveConfig} type="button">
+              {saveState === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+              Save
+            </Button>
+          </div>
+        </div>
+
+        <div className="space-y-3 border-t pt-4">
+          <h2 className="text-base font-semibold">Optimization</h2>
+
+          <div className="grid gap-2">
+            <label className="text-sm font-medium" htmlFor="optimization-max-mp">
+              Max megapixels
+            </label>
+            <input
+              className="h-10 w-48 rounded-md border border-input bg-background px-3 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring"
+              id="optimization-max-mp"
+              min={0}
+              onChange={(event) => updateOptimizationField("max_mp", Math.max(0, Number(event.target.value) || 0))}
+              step={0.1}
+              type="number"
+              value={config.optimization.max_mp}
+            />
+            <p className="text-xs text-muted-foreground">
+              Base64 images in requests larger than this many total megapixels are downscaled (aspect ratio
+              preserved) before being forwarded to the OpenAI endpoint. Set to 0 to disable.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <Button disabled={busy || !isOptimizationDirty} onClick={saveConfig} type="button">
               {saveState === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
               Save
             </Button>

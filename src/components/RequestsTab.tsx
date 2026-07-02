@@ -28,8 +28,10 @@ type RequestSummary = {
   elapsed_ms: number | null;
   error: string;
   request_body: string | null;
+  original_request_body: string | null;
   response_body: string | null;
   request_truncated: boolean;
+  original_request_truncated: boolean;
   response_truncated: boolean;
   validation_issues: string[];
   running: boolean;
@@ -105,11 +107,20 @@ function requestStatus(request: RequestSummary) {
   return String(request.status_code);
 }
 
+function prettyJson(body: string) {
+  try {
+    return JSON.stringify(JSON.parse(body), null, 2);
+  } catch {
+    return body;
+  }
+}
+
 function bodyPreview(body: string | null, truncated: boolean) {
   if (!body) {
     return "";
   }
-  return truncated ? `${body}\n[truncated]` : body;
+  const pretty = prettyJson(body);
+  return truncated ? `${pretty}\n[truncated]` : pretty;
 }
 
 function CopyButton({ text }: { text: string }) {
@@ -168,7 +179,9 @@ function RequestsTable({ emptyText, loading, requests }: { emptyText: string; lo
         <tbody>
           {requests.map((request) => {
             const hasIssues = request.validation_issues.length > 0;
-            const hasBody = Boolean(request.request_body || request.response_body || request.error || hasIssues);
+            const hasBody = Boolean(
+              request.original_request_body || request.request_body || request.response_body || request.error || hasIssues,
+            );
             const expanded = expandedRequestId === request.request_id;
 
             return (
@@ -190,11 +203,9 @@ function RequestsTable({ emptyText, loading, requests }: { emptyText: string; lo
                       {statusIcon(request)}
                       <span className={statusTone(request)}>{requestStatus(request)}</span>
                       {hasIssues ? (
-                        <AlertTriangle
-                          aria-label="Response validation issues"
-                          className="h-4 w-4 text-amber-700"
-                          title={request.validation_issues.join("; ")}
-                        />
+                        <span title={request.validation_issues.join("; ")}>
+                          <AlertTriangle aria-label="Response validation issues" className="h-4 w-4 text-amber-700" />
+                        </span>
                       ) : null}
                     </div>
                   </td>
@@ -227,10 +238,17 @@ function RequestsTable({ emptyText, loading, requests }: { emptyText: string; lo
                             </ul>
                           </div>
                         ) : null}
-                        <div className="grid gap-3 lg:grid-cols-2">
+                        <div className="grid gap-3 lg:grid-cols-3">
                           <div className="min-w-0 space-y-2">
                             <div className="flex items-center justify-between">
-                              <h4 className="text-xs font-medium uppercase text-muted-foreground">Request</h4>
+                              <h4 className="text-xs font-medium uppercase text-muted-foreground">Original request</h4>
+                              <CopyButton text={bodyPreview(request.original_request_body, request.original_request_truncated)} />
+                            </div>
+                            <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-xs leading-relaxed text-foreground">{bodyPreview(request.original_request_body, request.original_request_truncated) || "-"}</pre>
+                          </div>
+                          <div className="min-w-0 space-y-2">
+                            <div className="flex items-center justify-between">
+                              <h4 className="text-xs font-medium uppercase text-muted-foreground">Optimized request</h4>
                               <CopyButton text={bodyPreview(request.request_body, request.request_truncated)} />
                             </div>
                             <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-xs leading-relaxed text-foreground">{bodyPreview(request.request_body, request.request_truncated) || "-"}</pre>
@@ -295,7 +313,10 @@ export function RequestsTab() {
   const [onlyValidationFailures, setOnlyValidationFailures] = useState(false);
 
   const totalSaved = saved.length;
-  const recentWithBodies = useMemo(() => saved.filter((request) => request.request_body || request.response_body), [saved]);
+  const recentWithBodies = useMemo(
+    () => saved.filter((request) => request.original_request_body || request.request_body || request.response_body),
+    [saved],
+  );
   const allRequests = useMemo(() => {
     const merged = new Map<string, RequestSummary>();
     for (const request of active) {

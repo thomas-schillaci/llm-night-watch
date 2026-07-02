@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import io
 import json
 import re
 import shutil
@@ -15,6 +17,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from PIL import Image
 from pydantic import BaseModel, Field
 
 
@@ -27,8 +30,10 @@ DEFAULT_VLLM_API_KEY = "EMPTY"
 DEFAULT_VLLM_IMAGE = "vllm/vllm-openai:latest"
 DEFAULT_TEE_DB_PATH = "llm-night-watch.sqlite3"
 DEFAULT_MAX_BODY_BYTES = 1_000_000
+DEFAULT_OPTIMIZATION_MAX_MP = 2.3
 VALIDATION_SCHEMA_TYPES = {"string", "number", "integer", "boolean", "object", "array"}
 CHAT_COMPLETIONS_PATH = "chat/completions"
+DATA_URL_IMAGE_PATTERN = re.compile(r"^data:image/(?P<subtype>[a-zA-Z0-9.+-]+);base64,(?P<data>.+)$", re.DOTALL)
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -75,10 +80,15 @@ class ValidationConfig(BaseModel):
     fields: list[SchemaField] = Field(default_factory=list)
 
 
+class OptimizationConfig(BaseModel):
+    max_mp: float = DEFAULT_OPTIMIZATION_MAX_MP
+
+
 class AppConfig(BaseModel):
     vllm: VllmConfig = Field(default_factory=VllmConfig)
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
+    optimization: OptimizationConfig = Field(default_factory=OptimizationConfig)
 
 
 class VllmModelStatus(BaseModel):
@@ -131,8 +141,10 @@ class TeeRecord(BaseModel):
     latency_ms: float | None = None
     error: str = ""
     request_body: bytes | None = None
+    original_request_body: bytes | None = None
     response_body: bytes | None = None
     request_truncated: bool = False
+    original_request_truncated: bool = False
     response_truncated: bool = False
     validation_issues: list[str] = Field(default_factory=list)
 
@@ -149,8 +161,10 @@ class RequestSummary(BaseModel):
     elapsed_ms: float | None = None
     error: str = ""
     request_body: str | None = None
+    original_request_body: str | None = None
     response_body: str | None = None
     request_truncated: bool = False
+    original_request_truncated: bool = False
     response_truncated: bool = False
     validation_issues: list[str] = Field(default_factory=list)
     running: bool = False
@@ -216,6 +230,7 @@ def normalize_app_config(config: AppConfig) -> AppConfig:
         for field in config.validation.fields
         if field.name.strip()
     ]
+    config.optimization.max_mp = max(0.0, config.optimization.max_mp)
     return config
 
 
@@ -479,7 +494,9 @@ def init_tee_db(db_path: str) -> None:
                 response_body BLOB,
                 request_truncated INTEGER NOT NULL,
                 response_truncated INTEGER NOT NULL,
-                validation_issues TEXT NOT NULL DEFAULT '[]'
+                validation_issues TEXT NOT NULL DEFAULT '[]',
+                original_request_body BLOB,
+                original_request_truncated INTEGER NOT NULL DEFAULT 0
             )
             """,
         )
@@ -488,6 +505,10 @@ def init_tee_db(db_path: str) -> None:
         existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(openai_request_tee)")}
         if "validation_issues" not in existing_columns:
             connection.execute("ALTER TABLE openai_request_tee ADD COLUMN validation_issues TEXT NOT NULL DEFAULT '[]'")
+        if "original_request_body" not in existing_columns:
+            connection.execute("ALTER TABLE openai_request_tee ADD COLUMN original_request_body BLOB")
+        if "original_request_truncated" not in existing_columns:
+            connection.execute("ALTER TABLE openai_request_tee ADD COLUMN original_request_truncated INTEGER NOT NULL DEFAULT 0")
 
 
 def write_tee_record(db_path: str, record: TeeRecord) -> None:
@@ -509,9 +530,11 @@ def write_tee_record(db_path: str, record: TeeRecord) -> None:
                 response_body,
                 request_truncated,
                 response_truncated,
-                validation_issues
+                validation_issues,
+                original_request_body,
+                original_request_truncated
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.request_id,
@@ -528,6 +551,8 @@ def write_tee_record(db_path: str, record: TeeRecord) -> None:
                 int(record.request_truncated),
                 int(record.response_truncated),
                 json.dumps(record.validation_issues),
+                record.original_request_body,
+                int(record.original_request_truncated),
             ),
         )
 
@@ -574,8 +599,10 @@ def summarize_record(record: TeeRecord, running: bool = False) -> RequestSummary
         elapsed_ms=(time.time() - record.started_at) * 1000 if running else None,
         error=record.error,
         request_body=decode_body(record.request_body),
+        original_request_body=decode_body(record.original_request_body),
         response_body=decode_body(record.response_body),
         request_truncated=record.request_truncated,
+        original_request_truncated=record.original_request_truncated,
         response_truncated=record.response_truncated,
         validation_issues=list(record.validation_issues),
         running=running,
@@ -594,8 +621,10 @@ def summarize_saved_row(row: sqlite3.Row) -> RequestSummary:
         latency_ms=row["latency_ms"],
         error=row["error"],
         request_body=decode_body(row["request_body"]),
+        original_request_body=decode_body(row["original_request_body"]),
         response_body=decode_body(row["response_body"]),
         request_truncated=bool(row["request_truncated"]),
+        original_request_truncated=bool(row["original_request_truncated"]),
         response_truncated=bool(row["response_truncated"]),
         validation_issues=json.loads(row["validation_issues"]) if row["validation_issues"] else [],
         running=False,
@@ -648,10 +677,66 @@ def proxy_upstream_url(base_url: str, path: str) -> str:
     return urljoin(f"{normalize_vllm_url(base_url).rstrip('/')}/", f"v1/{path}")
 
 
+def downscale_base64_image(data_url: str, max_megapixels: float) -> str:
+    match = DATA_URL_IMAGE_PATTERN.match(data_url)
+    if not match:
+        return data_url
+    try:
+        raw = base64.b64decode(match.group("data"))
+        with Image.open(io.BytesIO(raw)) as image:
+            width, height = image.size
+            max_pixels = max_megapixels * 1_000_000
+            if width * height <= max_pixels:
+                return data_url
+            scale = (max_pixels / (width * height)) ** 0.5
+            new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+            save_format = image.format or "PNG"
+            resized = image.resize(new_size, Image.LANCZOS)
+            buffer = io.BytesIO()
+            resized.save(buffer, format=save_format)
+    except Exception:
+        return data_url
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/{match.group('subtype')};base64,{encoded}"
+
+
+def downscale_request_images(payload: object, max_megapixels: float) -> bool:
+    changed = False
+    if isinstance(payload, dict):
+        image_url = payload.get("image_url")
+        if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+            downscaled = downscale_base64_image(image_url["url"], max_megapixels)
+            if downscaled != image_url["url"]:
+                image_url["url"] = downscaled
+                changed = True
+        for value in payload.values():
+            if downscale_request_images(value, max_megapixels):
+                changed = True
+    elif isinstance(payload, list):
+        for item in payload:
+            if downscale_request_images(item, max_megapixels):
+                changed = True
+    return changed
+
+
+def optimize_request_body(body: bytes, max_megapixels: float) -> bytes:
+    if max_megapixels <= 0 or not body:
+        return body
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+    if downscale_request_images(payload, max_megapixels):
+        return json.dumps(payload).encode("utf-8")
+    return body
+
+
 async def proxy_openai_request(path: str, request: Request) -> Response:
     config = read_app_config()
     proxy = config.proxy
-    request_body = await request.body()
+    original_body = await request.body()
+    request_body = optimize_request_body(original_body, config.optimization.max_mp)
+    captured_original_body, original_truncated = capture_body(original_body, proxy.capture_bodies, proxy.max_body_bytes)
     captured_request_body, request_truncated = capture_body(request_body, proxy.capture_bodies, proxy.max_body_bytes)
     record = TeeRecord(
         request_id=str(uuid.uuid4()),
@@ -659,9 +744,11 @@ async def proxy_openai_request(path: str, request: Request) -> Response:
         method=request.method,
         path=f"/v1/{path}",
         query_string=request.url.query,
-        model=extract_model(request_body),
+        model=extract_model(original_body),
         request_body=captured_request_body,
+        original_request_body=captured_original_body,
         request_truncated=request_truncated,
+        original_request_truncated=original_truncated,
     )
     started = time.perf_counter()
     await track_active_request(record)
