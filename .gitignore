@@ -1,4 +1,9 @@
+.idea/
+
 # Local config and secrets
+llm-night-watch.sqlite3-*
+llm-night-watch.sqlite3
+llm-night-watch.config.json
 deploy.sh
 .env
 .env.*
