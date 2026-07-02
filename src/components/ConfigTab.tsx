@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { CheckCircle2, Eye, EyeOff, Loader2, Save, TestTube2, XCircle } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { CheckCircle2, Eye, EyeOff, Loader2, RefreshCw, Save, TestTube2, XCircle } from "lucide-react";
 import { Button } from "./ui/button";
 
 const API_BASE = "";
@@ -73,34 +73,31 @@ export function ConfigTab() {
 
   const isDirty = useMemo(() => JSON.stringify(config) !== JSON.stringify(savedConfig), [config, savedConfig]);
 
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadConfig() {
-      setLoadState("loading");
-      setMessage("");
-      try {
-        const payload = await readJson<ConfigStatus>(await fetch(`${API_BASE}/api/config`));
-        if (cancelled) {
-          return;
-        }
-        setConfig(payload.app_config);
-        setSavedConfig(payload.app_config);
-        setLoadState("success");
-      } catch (error) {
-        if (cancelled) {
-          return;
-        }
-        setLoadState("error");
-        setMessage(error instanceof Error ? error.message : "Could not load config");
+  const loadConfig = useCallback(async (signal?: AbortSignal) => {
+    setLoadState("loading");
+    setMessage("");
+    try {
+      const payload = await readJson<ConfigStatus>(await fetch(`${API_BASE}/api/config`, { signal }));
+      if (signal?.aborted) {
+        return;
       }
+      setConfig(payload.app_config);
+      setSavedConfig(payload.app_config);
+      setLoadState("success");
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return;
+      }
+      setLoadState("error");
+      setMessage(error instanceof Error ? error.message : "Could not load config");
     }
-
-    void loadConfig();
-    return () => {
-      cancelled = true;
-    };
   }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadConfig(controller.signal);
+    return () => controller.abort();
+  }, [loadConfig]);
 
   function updateProxyField<K extends keyof ProxyConfig>(field: K, value: ProxyConfig[K]) {
     setConfig((current) => ({
@@ -165,17 +162,47 @@ export function ConfigTab() {
     }
   }
 
-  const busy = loadState === "loading" || saveState === "loading" || testState === "loading";
-  const messageTone = saveState === "error" || testState === "error" || loadState === "error" ? "text-destructive" : "text-muted-foreground";
+  const busy = saveState === "loading" || testState === "loading";
+  const messageTone = saveState === "error" || testState === "error" ? "text-destructive" : "text-muted-foreground";
+
+  if (loadState === "loading") {
+    return (
+      <section className="mx-auto w-full max-w-[1600px] px-5 py-5">
+        <div className="max-w-3xl space-y-5">
+          <div className="grid gap-2">
+            <div className="h-4 w-16 animate-pulse rounded bg-muted" />
+            <div className="h-10 w-full animate-pulse rounded-md bg-muted" />
+          </div>
+          <div className="grid gap-2">
+            <div className="h-4 w-16 animate-pulse rounded bg-muted" />
+            <div className="h-10 w-full animate-pulse rounded-md bg-muted" />
+          </div>
+          <div className="flex gap-2 pt-1">
+            <div className="h-10 w-24 animate-pulse rounded-md bg-muted" />
+            <div className="h-10 w-24 animate-pulse rounded-md bg-muted" />
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  if (loadState === "error") {
+    return (
+      <section className="mx-auto w-full max-w-[1600px] px-5 py-5">
+        <div className="max-w-3xl space-y-4">
+          <p className="text-sm text-destructive">{message || "Could not load config"}</p>
+          <Button onClick={() => void loadConfig()} type="button" variant="outline">
+            <RefreshCw className="h-4 w-4" />
+            Retry
+          </Button>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="mx-auto w-full max-w-[1600px] px-5 py-5">
       <div className="max-w-3xl space-y-5">
-        <div className="space-y-1">
-          <h2 className="text-xl font-semibold tracking-normal">Config</h2>
-          <p className="text-sm text-muted-foreground">Point LLM Night Watch at your OpenAI-compatible upstream.</p>
-        </div>
-
         <form className="space-y-5" onSubmit={(event) => event.preventDefault()}>
           <div className="grid gap-2">
             <label className="text-sm font-medium" htmlFor="base-url">
@@ -183,7 +210,6 @@ export function ConfigTab() {
             </label>
             <input
               className="h-10 rounded-md border border-input bg-background px-3 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring"
-              disabled={loadState === "loading"}
               id="base-url"
               inputMode="url"
               onChange={(event) => updateProxyField("base_url", event.target.value)}
@@ -201,7 +227,6 @@ export function ConfigTab() {
             <div className="flex gap-2">
               <input
                 className="h-10 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring"
-                disabled={loadState === "loading"}
                 id="api-key"
                 onChange={(event) => updateProxyField("api_key", event.target.value)}
                 placeholder="EMPTY"
@@ -231,7 +256,7 @@ export function ConfigTab() {
               Test
             </Button>
             {testState === "success" ? <CheckCircle2 className="h-5 w-5 text-primary" /> : null}
-            {testState === "error" || saveState === "error" || loadState === "error" ? <XCircle className="h-5 w-5 text-destructive" /> : null}
+            {testState === "error" || saveState === "error" ? <XCircle className="h-5 w-5 text-destructive" /> : null}
           </div>
         </form>
 

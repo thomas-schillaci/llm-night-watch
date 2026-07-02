@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { AlertCircle, CheckCircle2, Clock3, Loader2, RefreshCw, XCircle } from "lucide-react";
+import { Fragment, useEffect, useMemo, useState } from "react";
+import { AlertCircle, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Copy, Loader2, RefreshCw, XCircle } from "lucide-react";
 import { Button } from "./ui/button";
 
 const API_BASE = "";
@@ -96,11 +96,44 @@ function bodyPreview(body: string | null, truncated: boolean) {
   if (!body) {
     return "";
   }
-  const preview = body.length > 800 ? `${body.slice(0, 800)}...` : body;
-  return truncated ? `${preview}\n[truncated]` : preview;
+  return truncated ? `${body}\n[truncated]` : body;
 }
 
-function RequestsTable({ emptyText, requests }: { emptyText: string; requests: RequestSummary[] }) {
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  if (!text) {
+    return null;
+  }
+
+  return (
+    <button
+      aria-label="Copy to clipboard"
+      className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+      onClick={async () => {
+        await navigator.clipboard.writeText(text);
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1500);
+      }}
+      type="button"
+    >
+      {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+    </button>
+  );
+}
+
+function RequestsTable({ emptyText, loading, requests }: { emptyText: string; loading: boolean; requests: RequestSummary[] }) {
+  const [expandedRequestId, setExpandedRequestId] = useState<string | null>(null);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center gap-2 rounded-md border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">
+        <Loader2 className="h-4 w-4 animate-spin" />
+        Loading requests…
+      </div>
+    );
+  }
+
   if (!requests.length) {
     return <div className="rounded-md border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">{emptyText}</div>;
   }
@@ -110,6 +143,7 @@ function RequestsTable({ emptyText, requests }: { emptyText: string; requests: R
       <table className="min-w-full border-collapse text-sm">
         <thead className="bg-muted text-left text-xs uppercase text-muted-foreground">
           <tr>
+            <th className="w-10 px-3 py-2 font-medium" aria-label="Details" />
             <th className="px-3 py-2 font-medium">Status</th>
             <th className="px-3 py-2 font-medium">Time</th>
             <th className="px-3 py-2 font-medium">Method</th>
@@ -119,58 +153,69 @@ function RequestsTable({ emptyText, requests }: { emptyText: string; requests: R
           </tr>
         </thead>
         <tbody>
-          {requests.map((request) => (
-            <tr className="border-t align-top" key={request.request_id}>
-              <td className="px-3 py-3">
-                <div className="flex items-center gap-2 whitespace-nowrap">
-                  {statusIcon(request)}
-                  <span className={statusTone(request)}>{requestStatus(request)}</span>
-                </div>
-              </td>
-              <td className="whitespace-nowrap px-3 py-3 text-muted-foreground">{formatTime(request.started_at)}</td>
-              <td className="px-3 py-3 font-medium">{request.method}</td>
-              <td className="max-w-[360px] px-3 py-3">
-                <div className="truncate font-medium">{request.path}</div>
-                {request.query_string ? <div className="truncate text-xs text-muted-foreground">?{request.query_string}</div> : null}
-              </td>
-              <td className="max-w-[220px] truncate px-3 py-3 text-muted-foreground">{request.model || "-"}</td>
-              <td className="whitespace-nowrap px-3 py-3 text-right text-muted-foreground">
-                {formatDuration(request.running ? request.elapsed_ms : request.latency_ms)}
-              </td>
-            </tr>
-          ))}
+          {requests.map((request) => {
+            const hasBody = Boolean(request.request_body || request.response_body || request.error);
+            const expanded = expandedRequestId === request.request_id;
+
+            return (
+              <Fragment key={request.request_id}>
+                <tr className="border-t align-middle">
+                  <td className="px-3 py-3">
+                    <button
+                      aria-label={expanded ? "Hide request details" : "Show request details"}
+                      className="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent disabled:opacity-30"
+                      disabled={!hasBody}
+                      onClick={() => setExpandedRequestId(expanded ? null : request.request_id)}
+                      type="button"
+                    >
+                      {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+                    </button>
+                  </td>
+                  <td className="px-3 py-3">
+                    <div className="flex items-center gap-2 whitespace-nowrap">
+                      {statusIcon(request)}
+                      <span className={statusTone(request)}>{requestStatus(request)}</span>
+                    </div>
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-3 text-muted-foreground">{formatTime(request.started_at)}</td>
+                  <td className="px-3 py-3 font-medium">{request.method}</td>
+                  <td className="max-w-[360px] px-3 py-3">
+                    <div className="truncate font-medium">{request.path}</div>
+                    {request.query_string ? <div className="truncate text-xs text-muted-foreground">?{request.query_string}</div> : null}
+                  </td>
+                  <td className="max-w-[220px] truncate px-3 py-3 text-muted-foreground">{request.model || "-"}</td>
+                  <td className="whitespace-nowrap px-3 py-3 text-right text-muted-foreground">
+                    {formatDuration(request.running ? request.elapsed_ms : request.latency_ms)}
+                  </td>
+                </tr>
+                {expanded ? (
+                  <tr className="border-t bg-card">
+                    <td className="px-3 py-3" />
+                    <td className="px-3 py-3" colSpan={6}>
+                      <div className="grid gap-3 lg:grid-cols-2">
+                        <div className="min-w-0 space-y-2">
+                          <div className="flex items-center justify-between">
+                            <h4 className="text-xs font-medium uppercase text-muted-foreground">Request</h4>
+                            <CopyButton text={bodyPreview(request.request_body, request.request_truncated)} />
+                          </div>
+                          <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-xs leading-relaxed text-foreground">{bodyPreview(request.request_body, request.request_truncated) || "-"}</pre>
+                        </div>
+                        <div className="min-w-0 space-y-2">
+                          <div className="flex items-center justify-between">
+                            <h4 className="text-xs font-medium uppercase text-muted-foreground">Response</h4>
+                            <CopyButton text={bodyPreview(request.response_body || request.error, request.response_truncated)} />
+                          </div>
+                          <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-xs leading-relaxed text-foreground">{bodyPreview(request.response_body || request.error, request.response_truncated) || "-"}</pre>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                ) : null}
+              </Fragment>
+            );
+          })}
         </tbody>
       </table>
-    </div>
-  );
-}
-
-function RequestDetails({ requests }: { requests: RequestSummary[] }) {
-  const withBodies = requests.filter((request) => request.request_body || request.response_body).slice(0, 5);
-
-  if (!withBodies.length) {
-    return null;
-  }
-
-  return (
-    <div className="space-y-3">
-      {withBodies.map((request) => (
-        <details className="rounded-md border bg-card" key={request.request_id}>
-          <summary className="cursor-pointer px-3 py-2 text-sm font-medium">
-            {request.method} {request.path} <span className="text-muted-foreground">{request.model || ""}</span>
-          </summary>
-          <div className="grid gap-3 border-t p-3 lg:grid-cols-2">
-            <div className="min-w-0 space-y-2">
-              <h4 className="text-xs font-medium uppercase text-muted-foreground">Request</h4>
-              <pre className="max-h-72 overflow-auto rounded-md bg-muted p-3 text-xs leading-relaxed text-foreground">{bodyPreview(request.request_body, request.request_truncated) || "-"}</pre>
-            </div>
-            <div className="min-w-0 space-y-2">
-              <h4 className="text-xs font-medium uppercase text-muted-foreground">Response</h4>
-              <pre className="max-h-72 overflow-auto rounded-md bg-muted p-3 text-xs leading-relaxed text-foreground">{bodyPreview(request.response_body, request.response_truncated) || "-"}</pre>
-            </div>
-          </div>
-        </details>
-      ))}
     </div>
   );
 }
@@ -179,6 +224,7 @@ export function RequestsTab() {
   const [active, setActive] = useState<RequestSummary[]>([]);
   const [saved, setSaved] = useState<RequestSummary[]>([]);
   const [loadState, setLoadState] = useState<LoadState>("idle");
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [message, setMessage] = useState("");
 
   async function loadRequests(signal?: AbortSignal) {
@@ -188,12 +234,14 @@ export function RequestsTab() {
       setActive(payload.active);
       setSaved(payload.saved);
       setLoadState("success");
+      setHasLoaded(true);
       setMessage("");
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         return;
       }
       setLoadState("error");
+      setHasLoaded(true);
       setMessage(error instanceof Error ? error.message : "Could not load requests");
     }
   }
@@ -210,49 +258,63 @@ export function RequestsTab() {
 
   const totalSaved = saved.length;
   const recentWithBodies = useMemo(() => saved.filter((request) => request.request_body || request.response_body), [saved]);
+  const allRequests = useMemo(() => {
+    const merged = new Map<string, RequestSummary>();
+    for (const request of active) {
+      merged.set(request.request_id, request);
+    }
+    for (const request of saved) {
+      merged.set(request.request_id, request);
+    }
+    return Array.from(merged.values()).sort((a, b) => b.started_at - a.started_at);
+  }, [active, saved]);
 
   return (
     <section className="mx-auto w-full max-w-[1600px] px-5 py-5">
       <div className="space-y-6">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="space-y-1">
-            <h2 className="text-xl font-semibold tracking-normal">Requests</h2>
-            <p className="text-sm text-muted-foreground">Live proxied requests and recent saved traffic.</p>
-          </div>
-          <Button disabled={loadState === "loading"} onClick={() => void loadRequests()} type="button" variant="outline">
-            {loadState === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-            Refresh
-          </Button>
-        </div>
-
         {message ? <p className="text-sm text-destructive">{message}</p> : null}
 
         <div className="grid gap-3 sm:grid-cols-3">
           <div className="rounded-md border bg-card px-4 py-3">
             <div className="flex items-center gap-2 text-sm text-muted-foreground"><Clock3 className="h-4 w-4" /> Running</div>
-            <div className="mt-2 text-2xl font-semibold">{active.length}</div>
+            {hasLoaded ? (
+              <div className="mt-2 text-2xl font-semibold">{active.length}</div>
+            ) : (
+              <div className="mt-2 h-8 w-10 animate-pulse rounded bg-muted" />
+            )}
           </div>
           <div className="rounded-md border bg-card px-4 py-3">
             <div className="text-sm text-muted-foreground">Saved</div>
-            <div className="mt-2 text-2xl font-semibold">{totalSaved}</div>
+            {hasLoaded ? (
+              <div className="mt-2 text-2xl font-semibold">{totalSaved}</div>
+            ) : (
+              <div className="mt-2 h-8 w-10 animate-pulse rounded bg-muted" />
+            )}
           </div>
           <div className="rounded-md border bg-card px-4 py-3">
             <div className="text-sm text-muted-foreground">Captured bodies</div>
-            <div className="mt-2 text-2xl font-semibold">{recentWithBodies.length}</div>
+            {hasLoaded ? (
+              <div className="mt-2 text-2xl font-semibold">{recentWithBodies.length}</div>
+            ) : (
+              <div className="mt-2 h-8 w-10 animate-pulse rounded bg-muted" />
+            )}
           </div>
         </div>
 
         <div className="space-y-3">
-          <h3 className="text-sm font-medium">Running</h3>
-          <RequestsTable emptyText="No requests are currently running." requests={active} />
+          <div className="flex justify-end">
+            <Button disabled={loadState === "loading"} onClick={() => void loadRequests()} type="button" variant="outline">
+              {loadState === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              Refresh
+            </Button>
+          </div>
+          <RequestsTable
+            emptyText="No requests yet. Send traffic through /v1/* to populate this list."
+            loading={!hasLoaded}
+            requests={allRequests}
+          />
         </div>
 
-        <div className="space-y-3">
-          <h3 className="text-sm font-medium">Saved</h3>
-          <RequestsTable emptyText="No saved requests yet. Send traffic through /v1/* to populate this list." requests={saved} />
-        </div>
-
-        <RequestDetails requests={saved} />
       </div>
     </section>
   );
