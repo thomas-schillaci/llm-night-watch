@@ -1,10 +1,12 @@
 import asyncio
 import json
+import re
 import shutil
 import sqlite3
 import subprocess
 import time
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from typing import AsyncIterator
 from urllib.parse import urljoin, urlparse
@@ -25,6 +27,8 @@ DEFAULT_VLLM_API_KEY = "EMPTY"
 DEFAULT_VLLM_IMAGE = "vllm/vllm-openai:latest"
 DEFAULT_TEE_DB_PATH = "llm-night-watch.sqlite3"
 DEFAULT_MAX_BODY_BYTES = 1_000_000
+VALIDATION_SCHEMA_TYPES = {"string", "number", "integer", "boolean", "object", "array"}
+CHAT_COMPLETIONS_PATH = "chat/completions"
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -61,9 +65,20 @@ class ProxyConfig(BaseModel):
     db_path: str = DEFAULT_TEE_DB_PATH
 
 
+class SchemaField(BaseModel):
+    name: str = ""
+    type: str = "string"
+    validator_code: str = ""
+
+
+class ValidationConfig(BaseModel):
+    fields: list[SchemaField] = Field(default_factory=list)
+
+
 class AppConfig(BaseModel):
     vllm: VllmConfig = Field(default_factory=VllmConfig)
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
+    validation: ValidationConfig = Field(default_factory=ValidationConfig)
 
 
 class VllmModelStatus(BaseModel):
@@ -99,6 +114,12 @@ class ProxyTestResult(BaseModel):
     error: str = ""
 
 
+class UpstreamStatus(BaseModel):
+    connected: bool
+    detail: str = ""
+    error: str = ""
+
+
 class TeeRecord(BaseModel):
     request_id: str
     started_at: float
@@ -113,6 +134,7 @@ class TeeRecord(BaseModel):
     response_body: bytes | None = None
     request_truncated: bool = False
     response_truncated: bool = False
+    validation_issues: list[str] = Field(default_factory=list)
 
 
 class RequestSummary(BaseModel):
@@ -130,6 +152,7 @@ class RequestSummary(BaseModel):
     response_body: str | None = None
     request_truncated: bool = False
     response_truncated: bool = False
+    validation_issues: list[str] = Field(default_factory=list)
     running: bool = False
 
 
@@ -184,6 +207,15 @@ def normalize_app_config(config: AppConfig) -> AppConfig:
     config.proxy.api_key = config.proxy.api_key.strip() or config.vllm.api_key
     config.proxy.max_body_bytes = normalize_body_limit(config.proxy.max_body_bytes)
     config.proxy.db_path = normalize_db_path(config.proxy.db_path)
+    config.validation.fields = [
+        SchemaField(
+            name=field.name.strip(),
+            type=field.type if field.type in VALIDATION_SCHEMA_TYPES else "string",
+            validator_code=field.validator_code,
+        )
+        for field in config.validation.fields
+        if field.name.strip()
+    ]
     return config
 
 
@@ -317,6 +349,115 @@ def extract_model(body: bytes) -> str:
     return str(model).strip() if model is not None else ""
 
 
+@lru_cache(maxsize=256)
+def _compile_field_validator(code: str):
+    indented = "\n".join(f"    {line}" for line in code.splitlines())
+    source = f"def _validator(cls, v):\n{indented}\n"
+    namespace: dict = {"re": re}
+    exec(compile(source, "<field_validator>", "exec"), namespace)
+    return namespace["_validator"]
+
+
+def run_field_validator(name: str, code: str, value: object) -> str | None:
+    try:
+        validator = _compile_field_validator(code)
+    except SyntaxError as exc:
+        return f"Field '{name}' validator has a syntax error: {exc}"
+    try:
+        validator(None, value)
+    except ValueError as exc:
+        return f"Field '{name}': {exc}"
+    except Exception as exc:
+        return f"Field '{name}' validator raised {type(exc).__name__}: {exc}"
+    return None
+
+
+def _matches_json_schema_type(value: object, expected_type: str) -> bool:
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    if expected_type == "object":
+        return isinstance(value, dict)
+    if expected_type == "array":
+        return isinstance(value, list)
+    return True
+
+
+def validate_against_schema(payload: object, fields: list[SchemaField]) -> list[str]:
+    if not isinstance(payload, dict):
+        return ["Response body is not a JSON object"]
+
+    issues: list[str] = []
+    fields_by_name = {field.name: field for field in fields}
+    for name in fields_by_name:
+        if name not in payload:
+            issues.append(f"Missing field '{name}'")
+
+    for name, value in payload.items():
+        field = fields_by_name.get(name)
+        if not field:
+            continue
+        if not _matches_json_schema_type(value, field.type):
+            issues.append(f"Field '{name}' expected type '{field.type}'")
+            continue
+        if field.validator_code.strip():
+            issue = run_field_validator(name, field.validator_code, value)
+            if issue:
+                issues.append(issue)
+
+    return issues
+
+
+def extract_message_content(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return None
+    message = first_choice.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    return content if isinstance(content, str) else None
+
+
+def compute_validation_issues(
+    path: str,
+    status_code: int | None,
+    body: bytes | None,
+    truncated: bool,
+    fields: list[SchemaField],
+) -> list[str]:
+    if path != CHAT_COMPLETIONS_PATH or not fields or not body or truncated:
+        return []
+    if status_code is None or status_code >= 400:
+        return []
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return ["Response body is not valid JSON"]
+
+    content = extract_message_content(payload)
+    if content is None:
+        return ["Response is missing choices[0].message.content"]
+
+    try:
+        parsed_content = json.loads(content)
+    except json.JSONDecodeError:
+        return ["choices[0].message.content is not valid JSON"]
+
+    return validate_against_schema(parsed_content, fields)
+
+
 def init_tee_db(db_path: str) -> None:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -337,12 +478,16 @@ def init_tee_db(db_path: str) -> None:
                 request_body BLOB,
                 response_body BLOB,
                 request_truncated INTEGER NOT NULL,
-                response_truncated INTEGER NOT NULL
+                response_truncated INTEGER NOT NULL,
+                validation_issues TEXT NOT NULL DEFAULT '[]'
             )
             """,
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_openai_request_tee_request_id ON openai_request_tee(request_id)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_openai_request_tee_started_at ON openai_request_tee(started_at)")
+        existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(openai_request_tee)")}
+        if "validation_issues" not in existing_columns:
+            connection.execute("ALTER TABLE openai_request_tee ADD COLUMN validation_issues TEXT NOT NULL DEFAULT '[]'")
 
 
 def write_tee_record(db_path: str, record: TeeRecord) -> None:
@@ -363,9 +508,10 @@ def write_tee_record(db_path: str, record: TeeRecord) -> None:
                 request_body,
                 response_body,
                 request_truncated,
-                response_truncated
+                response_truncated,
+                validation_issues
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.request_id,
@@ -381,6 +527,7 @@ def write_tee_record(db_path: str, record: TeeRecord) -> None:
                 record.response_body,
                 int(record.request_truncated),
                 int(record.response_truncated),
+                json.dumps(record.validation_issues),
             ),
         )
 
@@ -430,6 +577,7 @@ def summarize_record(record: TeeRecord, running: bool = False) -> RequestSummary
         response_body=decode_body(record.response_body),
         request_truncated=record.request_truncated,
         response_truncated=record.response_truncated,
+        validation_issues=list(record.validation_issues),
         running=running,
     )
 
@@ -449,6 +597,7 @@ def summarize_saved_row(row: sqlite3.Row) -> RequestSummary:
         response_body=decode_body(row["response_body"]),
         request_truncated=bool(row["request_truncated"]),
         response_truncated=bool(row["response_truncated"]),
+        validation_issues=json.loads(row["validation_issues"]) if row["validation_issues"] else [],
         running=False,
     )
 
@@ -548,6 +697,9 @@ async def proxy_openai_request(path: str, request: Request) -> Response:
         record.latency_ms = (time.perf_counter() - started) * 1000
         record.response_body = captured_response_body
         record.response_truncated = response_truncated
+        record.validation_issues = compute_validation_issues(
+            path, record.status_code, captured_response_body, response_truncated, config.validation.fields,
+        )
         await update_active_request(record)
         await safe_write_tee_record(proxy.db_path, record)
         await remove_active_request(record.request_id)
@@ -624,6 +776,18 @@ async def test_proxy_config(payload: ProxyTestRequest) -> ProxyTestResult:
     except ValueError as exc:
         return ProxyTestResult(ok=False, error=str(exc))
     return ProxyTestResult(ok=True, models=models, detail=f"Detected {len(models)} model(s)")
+
+
+@app.get("/api/status", response_model=UpstreamStatus)
+async def upstream_status() -> UpstreamStatus:
+    config = read_app_config()
+    try:
+        models = await detect_proxy_models(config.proxy.base_url, config.proxy.api_key)
+    except httpx.HTTPError as exc:
+        return UpstreamStatus(connected=False, error=str(exc))
+    except ValueError as exc:
+        return UpstreamStatus(connected=False, error=str(exc))
+    return UpstreamStatus(connected=True, detail=f"Detected {len(models)} model(s)")
 
 
 @app.get("/api/requests", response_model=RequestsResponse)

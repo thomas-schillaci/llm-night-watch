@@ -61,6 +61,45 @@ def test_config_test_endpoint_reports_models(monkeypatch, tmp_path):
     assert response.json() == {"ok": True, "models": ["model-a", "model-b"], "detail": "Detected 2 model(s)", "error": ""}
 
 
+def test_upstream_status_reports_connected(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    db_path = tmp_path / "tee.sqlite3"
+    write_config(config_path, db_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "http://upstream/v1/models"
+        return httpx.Response(200, json={"data": [{"id": "model-a"}]})
+
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    main.app.state.upstream_transport = httpx.MockTransport(handler)
+
+    with TestClient(main.app) as client:
+        response = client.get("/api/status")
+
+    assert response.status_code == 200
+    assert response.json() == {"connected": True, "detail": "Detected 1 model(s)", "error": ""}
+
+
+def test_upstream_status_reports_disconnected(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    db_path = tmp_path / "tee.sqlite3"
+    write_config(config_path, db_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    main.app.state.upstream_transport = httpx.MockTransport(handler)
+
+    with TestClient(main.app) as client:
+        response = client.get("/api/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["connected"] is False
+    assert "connection refused" in payload["error"]
+
+
 def test_non_streaming_proxy_forwards_and_captures(monkeypatch, tmp_path):
     config_path = tmp_path / "config.json"
     db_path = tmp_path / "tee.sqlite3"
@@ -187,6 +226,97 @@ def test_tee_write_failure_does_not_fail_proxy(monkeypatch, tmp_path):
     assert response.status_code == 200
     assert response.json() == {"ok": True}
 
+
+
+def test_chat_completions_response_is_flagged_when_schema_mismatches(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    db_path = tmp_path / "tee.sqlite3"
+    config_path.write_text(
+        json.dumps(
+            {
+                "vllm": {
+                    "url": "http://upstream",
+                    "model": "auto",
+                    "api_key": "configured-key",
+                    "image": "vllm/vllm-openai:latest",
+                },
+                "proxy": {
+                    "base_url": "http://upstream",
+                    "api_key": "configured-key",
+                    "capture_bodies": True,
+                    "max_body_bytes": 1_000_000,
+                    "db_path": str(db_path),
+                },
+                "validation": {"fields": [{"name": "id", "type": "string"}, {"name": "choices", "type": "array"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    message_content = json.dumps({"id": 123, "choices": "not-an-array"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": message_content}}]},
+        )
+
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    main.app.state.upstream_transport = httpx.MockTransport(handler)
+
+    with TestClient(main.app) as client:
+        response = client.post("/v1/chat/completions", json={"model": "night-model"})
+
+    assert response.status_code == 200
+
+    [record] = records(db_path)
+    issues = json.loads(record["validation_issues"])
+    assert "Field 'id' expected type 'string'" in issues
+    assert "Field 'choices' expected type 'array'" in issues
+
+
+def test_chat_completions_response_matching_schema_has_no_issues(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    db_path = tmp_path / "tee.sqlite3"
+    config_path.write_text(
+        json.dumps(
+            {
+                "vllm": {
+                    "url": "http://upstream",
+                    "model": "auto",
+                    "api_key": "configured-key",
+                    "image": "vllm/vllm-openai:latest",
+                },
+                "proxy": {
+                    "base_url": "http://upstream",
+                    "api_key": "configured-key",
+                    "capture_bodies": True,
+                    "max_body_bytes": 1_000_000,
+                    "db_path": str(db_path),
+                },
+                "validation": {"fields": [{"name": "id", "type": "string"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    message_content = json.dumps({"id": "chatcmpl_1"})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": message_content}}]},
+        )
+
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    main.app.state.upstream_transport = httpx.MockTransport(handler)
+
+    with TestClient(main.app) as client:
+        response = client.post("/v1/chat/completions", json={"model": "night-model"})
+
+    assert response.status_code == 200
+    [record] = records(db_path)
+    assert json.loads(record["validation_issues"]) == []
 
 
 def test_request_history_lists_active_and_saved(monkeypatch, tmp_path):

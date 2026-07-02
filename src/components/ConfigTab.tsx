@@ -1,8 +1,28 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { CheckCircle2, Eye, EyeOff, Loader2, RefreshCw, Save, TestTube2, XCircle } from "lucide-react";
+import {
+  CheckCircle2,
+  Code2,
+  Eraser,
+  Eye,
+  EyeOff,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Save,
+  TestTube2,
+  Trash2,
+  XCircle,
+} from "lucide-react";
+import CodeMirror from "@uiw/react-codemirror";
+import { python } from "@codemirror/lang-python";
+import { oneDark } from "@codemirror/theme-one-dark";
 import { Button } from "./ui/button";
 
+const PYTHON_EXTENSIONS = [python()];
+
 const API_BASE = "";
+
+const SCHEMA_TYPES = ["string", "number", "integer", "boolean", "object", "array"] as const;
 
 type VllmConfig = {
   url: string;
@@ -19,9 +39,20 @@ type ProxyConfig = {
   db_path: string;
 };
 
+type SchemaField = {
+  name: string;
+  type: string;
+  validator_code: string;
+};
+
+type ValidationConfig = {
+  fields: SchemaField[];
+};
+
 type AppConfig = {
   vllm: VllmConfig;
   proxy: ProxyConfig;
+  validation: ValidationConfig;
 };
 
 type ConfigStatus = {
@@ -51,7 +82,37 @@ const defaultConfig: AppConfig = {
     max_body_bytes: 1_000_000,
     db_path: "llm-night-watch.sqlite3",
   },
+  validation: {
+    fields: [],
+  },
 };
+
+type ValidatorEditorProps = {
+  code: string;
+  onChange: (code: string) => void;
+};
+
+function ValidatorEditor({ code, onChange }: ValidatorEditorProps) {
+  return (
+    <div className="grid gap-1">
+      <span className="text-xs font-medium text-muted-foreground">Validator code</span>
+      <CodeMirror
+        basicSetup={{ lineNumbers: false, foldGutter: false }}
+        className="overflow-hidden rounded-md border border-input text-xs"
+        extensions={PYTHON_EXTENSIONS}
+        height="160px"
+        onChange={onChange}
+        placeholder={"if v % 2 == 1:\n    raise ValueError(f'{v} is not even')\nreturn v"}
+        theme={oneDark}
+        value={code}
+      />
+      <p className="text-xs text-muted-foreground">
+        Python body of a field_validator(cls, v) classmethod (the `re` module is available). Raise ValueError to
+        flag the response; return v (or nothing) to pass.
+      </p>
+    </div>
+  );
+}
 
 async function readJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -70,8 +131,13 @@ export function ConfigTab() {
   const [testState, setTestState] = useState<AsyncState>("idle");
   const [message, setMessage] = useState("");
   const [models, setModels] = useState<string[]>([]);
+  const [expandedValidators, setExpandedValidators] = useState<Set<number>>(new Set());
 
-  const isDirty = useMemo(() => JSON.stringify(config) !== JSON.stringify(savedConfig), [config, savedConfig]);
+  const isProxyDirty = useMemo(() => JSON.stringify(config.proxy) !== JSON.stringify(savedConfig.proxy), [config.proxy, savedConfig.proxy]);
+  const isValidationDirty = useMemo(
+    () => JSON.stringify(config.validation) !== JSON.stringify(savedConfig.validation),
+    [config.validation, savedConfig.validation],
+  );
 
   const loadConfig = useCallback(async (signal?: AbortSignal) => {
     setLoadState("loading");
@@ -107,6 +173,60 @@ export function ConfigTab() {
         [field]: value,
       },
     }));
+  }
+
+  function addValidationField() {
+    setConfig((current) => ({
+      ...current,
+      validation: {
+        ...current.validation,
+        fields: [...current.validation.fields, { name: "", type: "string", validator_code: "" }],
+      },
+    }));
+  }
+
+  function updateValidationField(index: number, patch: Partial<SchemaField>) {
+    setConfig((current) => ({
+      ...current,
+      validation: {
+        ...current.validation,
+        fields: current.validation.fields.map((field, i) => (i === index ? { ...field, ...patch } : field)),
+      },
+    }));
+  }
+
+  function addValidatorEditor(index: number) {
+    setExpandedValidators((current) => new Set(current).add(index));
+  }
+
+  function removeValidatorEditor(index: number) {
+    setExpandedValidators((current) => {
+      const next = new Set(current);
+      next.delete(index);
+      return next;
+    });
+    updateValidationField(index, { validator_code: "" });
+  }
+
+  function removeValidationField(index: number) {
+    setConfig((current) => ({
+      ...current,
+      validation: {
+        ...current.validation,
+        fields: current.validation.fields.filter((_, i) => i !== index),
+      },
+    }));
+    setExpandedValidators((current) => {
+      const next = new Set<number>();
+      for (const expandedIndex of current) {
+        if (expandedIndex < index) {
+          next.add(expandedIndex);
+        } else if (expandedIndex > index) {
+          next.add(expandedIndex - 1);
+        }
+      }
+      return next;
+    });
   }
 
   async function saveConfig() {
@@ -204,6 +324,8 @@ export function ConfigTab() {
     <section className="mx-auto w-full max-w-[1600px] px-5 py-5">
       <div className="max-w-3xl space-y-5">
         <form className="space-y-5" onSubmit={(event) => event.preventDefault()}>
+          <h2 className="text-base font-semibold">OpenAI endpoint</h2>
+
           <div className="grid gap-2">
             <label className="text-sm font-medium" htmlFor="base-url">
               Base URL
@@ -247,33 +369,94 @@ export function ConfigTab() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2 pt-1">
-            <Button disabled={busy || !isDirty} onClick={saveConfig} type="button">
-              {saveState === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-              Save
-            </Button>
             <Button disabled={busy || !config.proxy.base_url.trim()} onClick={testConfig} type="button" variant="outline">
               {testState === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : <TestTube2 className="h-4 w-4" />}
               Test
+            </Button>
+            <Button disabled={busy || !isProxyDirty} onClick={saveConfig} type="button">
+              {saveState === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+              Save
             </Button>
             {testState === "success" ? <CheckCircle2 className="h-5 w-5 text-primary" /> : null}
             {testState === "error" || saveState === "error" ? <XCircle className="h-5 w-5 text-destructive" /> : null}
           </div>
         </form>
 
-        {message ? <p className={`text-sm ${messageTone}`}>{message}</p> : null}
+        <div className="space-y-3 border-t pt-4">
+          <h2 className="text-base font-semibold">Response validation schema</h2>
 
-        {models.length ? (
-          <div className="space-y-2 border-t pt-4">
-            <h3 className="text-sm font-medium">Models</h3>
-            <div className="flex flex-wrap gap-2">
-              {models.map((model) => (
-                <span className="rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground" key={model}>
-                  {model}
-                </span>
-              ))}
+          {config.validation.fields.length ? (
+            <div className="space-y-3">
+              {config.validation.fields.map((field, index) => {
+                const hasValidator = expandedValidators.has(index) || field.validator_code.trim() !== "";
+                return (
+                  <div className="space-y-2 rounded-md border border-input p-3" key={index}>
+                    <div className="flex items-center gap-2">
+                      <input
+                        className="h-10 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring"
+                        onChange={(event) => updateValidationField(index, { name: event.target.value })}
+                        placeholder="field name"
+                        spellCheck={false}
+                        type="text"
+                        value={field.name}
+                      />
+                      <select
+                        className="h-10 w-36 rounded-md border border-input bg-background px-3 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring"
+                        onChange={(event) => updateValidationField(index, { type: event.target.value })}
+                        value={field.type}
+                      >
+                        {SCHEMA_TYPES.map((type) => (
+                          <option key={type} value={type}>
+                            {type}
+                          </option>
+                        ))}
+                      </select>
+                      <Button
+                        aria-label={hasValidator ? "Remove validator code" : "Add validator code"}
+                        onClick={() => (hasValidator ? removeValidatorEditor(index) : addValidatorEditor(index))}
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                      >
+                        {hasValidator ? <Eraser className="h-4 w-4" /> : <Code2 className="h-4 w-4" />}
+                      </Button>
+                      <Button
+                        aria-label="Remove field"
+                        onClick={() => removeValidationField(index)}
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                    {hasValidator ? (
+                      <ValidatorEditor
+                        code={field.validator_code}
+                        onChange={(code) => updateValidationField(index, { validator_code: code })}
+                      />
+                    ) : null}
+                  </div>
+                );
+              })}
             </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">No fields defined. Responses will not be validated.</p>
+          )}
+
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <Button onClick={addValidationField} type="button" variant="outline" size="sm">
+              <Plus className="h-4 w-4" />
+              Add field
+            </Button>
+            <Button disabled={busy || !isValidationDirty} onClick={saveConfig} type="button">
+              {saveState === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+              Save
+            </Button>
           </div>
-        ) : null}
+        </div>
+
+        {message ? <p className={`text-sm ${messageTone}`}>{message}</p> : null}
       </div>
     </section>
   );

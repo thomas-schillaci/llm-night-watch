@@ -1,5 +1,17 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
-import { AlertCircle, Check, CheckCircle2, ChevronDown, ChevronRight, Clock3, Copy, Loader2, RefreshCw, XCircle } from "lucide-react";
+import {
+  AlertCircle,
+  AlertTriangle,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Clock3,
+  Copy,
+  Loader2,
+  RefreshCw,
+  XCircle,
+} from "lucide-react";
 import { Button } from "./ui/button";
 
 const API_BASE = "";
@@ -19,6 +31,7 @@ type RequestSummary = {
   response_body: string | null;
   request_truncated: boolean;
   response_truncated: boolean;
+  validation_issues: string[];
   running: boolean;
 };
 
@@ -154,7 +167,8 @@ function RequestsTable({ emptyText, loading, requests }: { emptyText: string; lo
         </thead>
         <tbody>
           {requests.map((request) => {
-            const hasBody = Boolean(request.request_body || request.response_body || request.error);
+            const hasIssues = request.validation_issues.length > 0;
+            const hasBody = Boolean(request.request_body || request.response_body || request.error || hasIssues);
             const expanded = expandedRequestId === request.request_id;
 
             return (
@@ -175,6 +189,13 @@ function RequestsTable({ emptyText, loading, requests }: { emptyText: string; lo
                     <div className="flex items-center gap-2 whitespace-nowrap">
                       {statusIcon(request)}
                       <span className={statusTone(request)}>{requestStatus(request)}</span>
+                      {hasIssues ? (
+                        <AlertTriangle
+                          aria-label="Response validation issues"
+                          className="h-4 w-4 text-amber-700"
+                          title={request.validation_issues.join("; ")}
+                        />
+                      ) : null}
                     </div>
                   </td>
                   <td className="whitespace-nowrap px-3 py-3 text-muted-foreground">{formatTime(request.started_at)}</td>
@@ -192,20 +213,35 @@ function RequestsTable({ emptyText, loading, requests }: { emptyText: string; lo
                   <tr className="border-t bg-card">
                     <td className="px-3 py-3" />
                     <td className="px-3 py-3" colSpan={6}>
-                      <div className="grid gap-3 lg:grid-cols-2">
-                        <div className="min-w-0 space-y-2">
-                          <div className="flex items-center justify-between">
-                            <h4 className="text-xs font-medium uppercase text-muted-foreground">Request</h4>
-                            <CopyButton text={bodyPreview(request.request_body, request.request_truncated)} />
+                      <div className="space-y-3">
+                        {hasIssues ? (
+                          <div className="space-y-2 rounded-md border border-amber-700/30 bg-amber-700/10 p-3">
+                            <h4 className="flex items-center gap-2 text-xs font-medium uppercase text-amber-700">
+                              <AlertTriangle className="h-3.5 w-3.5" />
+                              Validation issues
+                            </h4>
+                            <ul className="list-inside list-disc space-y-1 text-xs text-amber-700">
+                              {request.validation_issues.map((issue, index) => (
+                                <li key={index}>{issue}</li>
+                              ))}
+                            </ul>
                           </div>
-                          <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-xs leading-relaxed text-foreground">{bodyPreview(request.request_body, request.request_truncated) || "-"}</pre>
-                        </div>
-                        <div className="min-w-0 space-y-2">
-                          <div className="flex items-center justify-between">
-                            <h4 className="text-xs font-medium uppercase text-muted-foreground">Response</h4>
-                            <CopyButton text={bodyPreview(request.response_body || request.error, request.response_truncated)} />
+                        ) : null}
+                        <div className="grid gap-3 lg:grid-cols-2">
+                          <div className="min-w-0 space-y-2">
+                            <div className="flex items-center justify-between">
+                              <h4 className="text-xs font-medium uppercase text-muted-foreground">Request</h4>
+                              <CopyButton text={bodyPreview(request.request_body, request.request_truncated)} />
+                            </div>
+                            <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-xs leading-relaxed text-foreground">{bodyPreview(request.request_body, request.request_truncated) || "-"}</pre>
                           </div>
-                          <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-xs leading-relaxed text-foreground">{bodyPreview(request.response_body || request.error, request.response_truncated) || "-"}</pre>
+                          <div className="min-w-0 space-y-2">
+                            <div className="flex items-center justify-between">
+                              <h4 className="text-xs font-medium uppercase text-muted-foreground">Response</h4>
+                              <CopyButton text={bodyPreview(request.response_body || request.error, request.response_truncated)} />
+                            </div>
+                            <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-xs leading-relaxed text-foreground">{bodyPreview(request.response_body || request.error, request.response_truncated) || "-"}</pre>
+                          </div>
                         </div>
                       </div>
                     </td>
@@ -256,6 +292,8 @@ export function RequestsTab() {
     };
   }, []);
 
+  const [onlyValidationFailures, setOnlyValidationFailures] = useState(false);
+
   const totalSaved = saved.length;
   const recentWithBodies = useMemo(() => saved.filter((request) => request.request_body || request.response_body), [saved]);
   const allRequests = useMemo(() => {
@@ -268,6 +306,14 @@ export function RequestsTab() {
     }
     return Array.from(merged.values()).sort((a, b) => b.started_at - a.started_at);
   }, [active, saved]);
+  const validationFailureCount = useMemo(
+    () => allRequests.filter((request) => request.validation_issues.length > 0).length,
+    [allRequests],
+  );
+  const visibleRequests = useMemo(
+    () => (onlyValidationFailures ? allRequests.filter((request) => request.validation_issues.length > 0) : allRequests),
+    [allRequests, onlyValidationFailures],
+  );
 
   return (
     <section className="mx-auto w-full max-w-[1600px] px-5 py-5">
@@ -302,16 +348,30 @@ export function RequestsTab() {
         </div>
 
         <div className="space-y-3">
-          <div className="flex justify-end">
+          <div className="flex items-center justify-between gap-2">
+            <Button
+              className={onlyValidationFailures ? "border-amber-700/50 text-amber-700" : ""}
+              onClick={() => setOnlyValidationFailures((current) => !current)}
+              type="button"
+              variant={onlyValidationFailures ? "secondary" : "outline"}
+            >
+              <AlertTriangle className="h-4 w-4" />
+              {onlyValidationFailures ? "Showing validation failures" : "Show validation failures only"}
+              {validationFailureCount > 0 ? ` (${validationFailureCount})` : ""}
+            </Button>
             <Button disabled={loadState === "loading"} onClick={() => void loadRequests()} type="button" variant="outline">
               {loadState === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
               Refresh
             </Button>
           </div>
           <RequestsTable
-            emptyText="No requests yet. Send traffic through /v1/* to populate this list."
+            emptyText={
+              onlyValidationFailures
+                ? "No requests with validation issues."
+                : "No requests yet. Send traffic through /v1/* to populate this list."
+            }
             loading={!hasLoaded}
-            requests={allRequests}
+            requests={visibleRequests}
           />
         </div>
 
